@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import csv
 from dataclasses import asdict
 from datetime import datetime
+from functools import partial
 import math
 import os
 from pathlib import Path
@@ -361,8 +362,14 @@ def run_benchmark(
 
                     for workers in plan.thread_counts:
                         with ThreadPoolExecutor(max_workers=workers) as executor:
+                            threaded_operation = partial(
+                                run_threaded,
+                                images,
+                                prepared_alb,
+                                executor,
+                            )
                             threaded_stats = measure(
-                                lambda executor=executor: run_threaded(images, prepared_alb, executor),
+                                threaded_operation,
                                 warmups=plan.warmups,
                                 repetitions=plan.repetitions,
                             )
@@ -550,17 +557,22 @@ def run_benchmark(
                             )
 
                             for block_x, block_y in plan.gpu_blocks:
-                                block = (block_x, block_y)
+                                current_block = (block_x, block_y)
                                 geometry = launch_geometry(
-                                    resolution, resolution, batch_size, block
+                                    resolution, resolution, batch_size, current_block
                                 )
-                                workspace = create_workspace(
+                                current_workspace = create_workspace(
                                     batch_size, resolution, resolution
                                 )
+                                cupy_operation = partial(
+                                    apply_cupy_device,
+                                    device_input,
+                                    cupy_parameters,
+                                    current_workspace,
+                                    current_block,
+                                )
                                 cupy_device_stats = measure(
-                                    lambda workspace=workspace, block=block: apply_cupy_device(
-                                        device_input, cupy_parameters, workspace, block
-                                    ),
+                                    cupy_operation,
                                     warmups=plan.warmups,
                                     repetitions=plan.repetitions,
                                     synchronize=synchronize_cupy,

@@ -1,3 +1,8 @@
+# Numerical comparison metrics used by the benchmark and preview modes.
+#
+# The project does not assume that outputs from different libraries must match
+# bit by bit. It therefore reports exact equality and softer perceptual metrics.
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -22,6 +27,7 @@ class ComparisonMetrics:
 
 
 def _global_ssim(reference: np.ndarray, candidate: np.ndarray) -> float:
+    # Compute a simple global SSIM approximation over the whole image batch.
     ref = reference.astype(np.float64) / 255.0
     cand = candidate.astype(np.float64) / 255.0
     c1 = 0.01 ** 2
@@ -47,6 +53,7 @@ def compare_batches(
     reference_images: list[np.ndarray],
     candidate_images: list[np.ndarray],
 ) -> ComparisonMetrics:
+    # Compare two RGB image batches and return the aggregate metrics.
     if len(reference_images) != len(candidate_images):
         return ComparisonMetrics(False, False, -1, -1, math.inf, math.inf, math.inf, 0.0, 0.0)
 

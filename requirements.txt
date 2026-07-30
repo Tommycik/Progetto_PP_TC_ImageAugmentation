@@ -1,6 +1,5 @@
+numpy
+pillow
+opencv-python
 albumentations==2.0.8
-kornia>=0.8.1,<0.9
-cupy-cuda13x>=14.0,<15
-numpy>=2.0,<3
-opencv-python>=4.10,<5
-Pillow>=11,<13
+kornia

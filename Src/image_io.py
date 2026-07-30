@@ -6,6 +6,8 @@ from typing import Iterable
 import numpy as np
 from PIL import Image, ImageDraw
 
+# Image loading, resizing and preview-writing helpers.
+
 
 SUPPORTED_EXTENSIONS = {
     ".png",
@@ -21,6 +23,7 @@ SUPPORTED_EXTENSIONS = {
 
 
 def synthetic_image(width: int = 1024, height: int = 1024) -> np.ndarray:
+    # Create a deterministic synthetic RGB image rich in geometric detail.
     y, x = np.mgrid[0:height, 0:width]
     red = ((x / max(width - 1, 1)) * 255.0).astype(np.uint8)
     green = ((y / max(height - 1, 1)) * 255.0).astype(np.uint8)
@@ -41,6 +44,7 @@ def _read_image(path: Path) -> np.ndarray:
 
 
 def load_source_images(path_text: str) -> tuple[list[np.ndarray], str]:
+    # Load one image or a directory of images or use the synthetic fallback.
     cleaned = path_text.strip().strip('"')
     if not cleaned:
         return [synthetic_image()], "synthetic"
@@ -63,12 +67,14 @@ def load_source_images(path_text: str) -> tuple[list[np.ndarray], str]:
 
 
 def resize_image(image: np.ndarray, size: int) -> np.ndarray:
+    # Resize an image to a square resolution used by the benchmark.
     pil_image = Image.fromarray(image, mode="RGB")
     resized = pil_image.resize((size, size), Image.Resampling.BILINEAR)
     return np.asarray(resized, dtype=np.uint8)
 
 
 def build_batch(images: list[np.ndarray], size: int, batch_size: int) -> list[np.ndarray]:
+    # Build a repeated batch from the available source images.
     if not images:
         raise ValueError("At least one source image is required.")
     resized = [resize_image(image, size) for image in images]
@@ -76,6 +82,7 @@ def build_batch(images: list[np.ndarray], size: int, batch_size: int) -> list[np
 
 
 def save_rgb_image(path: Path, image: np.ndarray) -> None:
+    # Save one RGB uint8 image to disk.
     path.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(np.clip(image, 0, 255).astype(np.uint8), mode="RGB").save(path)
 
@@ -85,6 +92,7 @@ def make_contact_sheet(
     output_path: Path,
     max_images_per_group: int = 8,
 ) -> None:
+    # Create a simple contact sheet for quick visual comparison.
     prepared = [(name, images[:max_images_per_group]) for name, images in groups if images]
     if not prepared:
         return

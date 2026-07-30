@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -5,6 +6,7 @@ import statistics
 import time
 from typing import Callable, Generic, TypeVar
 
+# Timing utilities
 
 T = TypeVar("T")
 
@@ -27,6 +29,7 @@ def measure(
     repetitions: int,
     synchronize: Callable[[], None] | None = None,
 ) -> TimingStatistics[T]:
+    # Measure one callable with warm-ups and repeated timing samples.
     if repetitions < 1:
         raise ValueError("At least one measured repetition is required.")
 

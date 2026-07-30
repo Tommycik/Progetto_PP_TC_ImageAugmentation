@@ -20,10 +20,9 @@ from .cupy_backend import (
     cupy_version,
 )
 from .config import (
-    FULL_PLAN,
+    FULL_BENCHMARK_PLAN,
     PREVIEWS_ROOT,
     PROFILES,
-    QUICK_PLAN,
     RESULTS_ROOT,
     ensure_output_directories,
 )
@@ -32,15 +31,18 @@ from .preview import generate_previews
 
 
 def _configure_runtime() -> None:
+    # Reduce hidden internal threading so the benchmark stays controlled.
     cv2.setNumThreads(1)
     torch.set_num_threads(1)
     try:
         torch.set_num_interop_threads(1)
     except RuntimeError:
+        # PyTorch only allows changing the setting before certain operations.
         pass
 
 
 def _read_source_images() -> tuple[list[object], str]:
+    # Read one image, a directory of images or fall back to the synthetic input.
     print("\nEnter an image path or a directory containing images.")
     print("Press Enter to use the deterministic synthetic image.")
     path_text = input("Input path: ")
@@ -48,20 +50,8 @@ def _read_source_images() -> tuple[list[object], str]:
     print(f"Loaded {len(images)} source image(s) from: {source}")
     return images, source
 
-
-def _select_profile() -> str:
-    names = list(PROFILES.keys())
-    print("\nAugmentation profiles:")
-    for index, name in enumerate(names, start=1):
-        print(f"{index}. {name}: {PROFILES[name].description}")
-    while True:
-        choice = input("Profile: ").strip()
-        if choice.isdigit() and 1 <= int(choice) <= len(names):
-            return names[int(choice) - 1]
-        print("Invalid profile selection.")
-
-
 def _read_integer(prompt: str, default: int, minimum: int, maximum: int) -> int:
+    # Read a bounded integer from the console.
     while True:
         value = input(f"{prompt} [{default}]: ").strip()
         if not value:
@@ -72,11 +62,13 @@ def _read_integer(prompt: str, default: int, minimum: int, maximum: int) -> int:
 
 
 def _environment_report() -> None:
+    # Print a compact runtime report useful before starting the benchmark.
     print("\nENVIRONMENT")
     print(f"Python: {sys.version.split()[0]}")
     print(f"Platform: {platform.platform()}")
     print(f"Logical CPU cores: {os.cpu_count()}")
     print(f"NumPy: {numpy.__version__}")
+    print(f"Pillow: {Image.__version__}")
     print(f"OpenCV: {cv2.__version__}")
     print(f"Albumentations: {albumentations.__version__}")
     print(f"PyTorch: {torch.__version__}")
@@ -98,10 +90,11 @@ def _environment_report() -> None:
 
 
 def run_application() -> None:
+    # Start the interactive menu and run the benchmark or generate previews.
     ensure_output_directories()
     _configure_runtime()
 
-    print("IMAGE AUGMENTATION BENCHMARK - PYTHON")
+    print("Image augmentation benchmark and preview generator")
     print(
         "Albumentations sequential/threaded CPU, Kornia CPU/CUDA and "
         "CuPy CUDA block-size tests"
@@ -110,36 +103,29 @@ def run_application() -> None:
     print(f"Preview output: {PREVIEWS_ROOT}")
 
     while True:
-        print("\n1. Quick benchmark")
-        print("2. Full benchmark")
-        print("3. Generate previews")
-        print("4. Check environment")
-        print("5. Exit")
+        print("\n1. Benchmark")
+        print("2. Generate previews")
+        print("3. Check environment")
+        print("4. Exit")
         choice = input("Selection: ").strip()
 
         try:
             if choice == "1":
                 images, source = _read_source_images()
-                run_benchmark(images, source, QUICK_PLAN)
+                run_benchmark(images, source, FULL_BENCHMARK_PLAN)
             elif choice == "2":
-                print(
-                    "\nThe full benchmark tests five profiles, batches up to 32, "
-                    "six CPU thread counts and nine explicit CUDA block layouts."
-                )
-                confirmation = input("Continue? [y/N]: ").strip().lower()
-                if confirmation != "y":
-                    continue
-                images, source = _read_source_images()
-                run_benchmark(images, source, FULL_PLAN)
-            elif choice == "3":
                 images, _ = _read_source_images()
-                profile_name = _select_profile()
-                resolution = _read_integer("Preview resolution", 512, 128, 2048)
-                batch_size = _read_integer("Preview batch size", 8, 1, 32)
-                generate_previews(images, profile_name, resolution, batch_size)
-            elif choice == "4":
+
+                generate_previews(
+                    images,
+                    profile_name="MixedStrong",
+                    resolution=512,
+                    batch_size=8,
+                    mode="fast",
+                )
+            elif choice == "3":
                 _environment_report()
-            elif choice == "5":
+            elif choice == "4":
                 print("Program closed.")
                 return
             else:

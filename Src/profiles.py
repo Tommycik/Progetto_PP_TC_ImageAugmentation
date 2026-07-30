@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 from dataclasses import dataclass
 
 from .config import AugmentationProfile
@@ -20,7 +19,7 @@ class SampleParameters:
 
 
 def parameters_for_sample(profile: AugmentationProfile, sample_index: int) -> SampleParameters:
-    """Create deterministic per-sample parameters shared by both libraries."""
+    # Create deterministic parameters for a given batch index.
     direction = -1.0 if sample_index % 2 else 1.0
     secondary_direction = -1.0 if (sample_index // 2) % 2 else 1.0
     magnitude_cycle = (1.0, 0.65, 0.35, 0.85)
@@ -32,8 +31,8 @@ def parameters_for_sample(profile: AugmentationProfile, sample_index: int) -> Sa
     translate_x = profile.translate_fraction * direction * magnitude
     translate_y = profile.translate_fraction * secondary_direction * magnitude
     scale = 1.0 + profile.scale_delta * secondary_direction * magnitude
-    brightness = profile.brightness_delta * direction * magnitude
     contrast = 1.0 + profile.contrast_delta * secondary_direction * magnitude
+    brightness = profile.brightness_delta * direction * magnitude
 
     return SampleParameters(
         horizontal_flip=horizontal_flip,

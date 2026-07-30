@@ -1,3 +1,9 @@
+# CuPy RawKernel backend.
+#
+# This module exists because Kornia does not expose low-level CUDA block sizes.
+# CuPy RawKernel makes it possible to keep the project in Python while still
+# measuring the effect of explicit block geometries on GPU execution.
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -15,6 +21,7 @@ except ImportError:  # CuPy remains optional so CPU-only startup can report the 
     cp = None  # type: ignore[assignment]
 
 
+# CUDA kernels used by the CuPy backend.
 AFFINE_COLOR_SOURCE = r'''
 extern "C" {
 
@@ -293,6 +300,7 @@ def _kernels() -> tuple[Any, Any, Any]:
 
 
 def numpy_float_batch(images: list[np.ndarray]) -> np.ndarray:
+    # Convert a uint8 RGB batch to float32 in the [0, 1] range.
     return np.stack(images, axis=0).astype(np.float32, copy=False) / 255.0
 
 
@@ -366,6 +374,7 @@ def prepare_cupy_parameters(
 
 
 def create_workspace(batch_size: int, height: int, width: int) -> CuPyWorkspace:
+    # Allocate temporary device buffers reused across repeated kernel launches.
     module = _require_cupy()
     shape = (batch_size, height, width, 3)
     return CuPyWorkspace(

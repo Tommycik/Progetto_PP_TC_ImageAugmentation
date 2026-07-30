@@ -1,3 +1,9 @@
+# Kornia and PyTorch backend helpers.
+#
+# Kornia is used as a tensor-oriented implementation that can run on both CPU
+# and CUDA. The same code path is useful for comparing device behaviour and for
+# measuring the effect of batch-oriented execution.
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -24,6 +30,7 @@ class KorniaParameters:
 
 
 def numpy_batch_to_tensor(images: list[object]) -> torch.Tensor:
+    # Convert an RGB uint8 batch into a float tensor in BCHW format.
     import numpy as np
 
     batch = np.stack(images, axis=0)
@@ -32,6 +39,7 @@ def numpy_batch_to_tensor(images: list[object]) -> torch.Tensor:
 
 
 def tensor_to_numpy_batch(tensor: torch.Tensor) -> list[object]:
+    # Convert a BCHW float tensor back to a list of RGB uint8 images.
     array = (
         tensor.detach()
         .clamp(0.0, 1.0)
@@ -52,6 +60,7 @@ def prepare_kornia_parameters(
     height: int,
     device: torch.device,
 ) -> KorniaParameters:
+    # Prepare all per-sample parameters as tensors on the target device.
     values = [parameters_for_sample(profile, index) for index in range(batch_size)]
 
     def tensor(data: list[float] | list[bool], dtype: torch.dtype = torch.float32) -> torch.Tensor:
@@ -72,6 +81,7 @@ def prepare_kornia_parameters(
 
 
 def apply_kornia(batch: torch.Tensor, parameters: KorniaParameters) -> torch.Tensor:
+    # Apply the Kornia pipeline to a complete batch.
     with torch.inference_mode():
         output = batch
         batch_size, _, height, width = output.shape
