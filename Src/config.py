@@ -5,23 +5,33 @@ from pathlib import Path
 from typing import Final
 
 
-# project directories used by the menu, the benchmark and the preview generator
+# -----------------------------------------------------------------------------
+# project paths
+# -----------------------------------------------------------------------------
+
+# directories used by the menu, benchmark and preview generator
 PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
 OUTPUT_ROOT: Final[Path] = PROJECT_ROOT / "Output"
 RESULTS_ROOT: Final[Path] = OUTPUT_ROOT / "Results"
 PREVIEWS_ROOT: Final[Path] = OUTPUT_ROOT / "Previews"
 
-# deterministic seed and comparison thresholds used across the project
-DEFAULT_SEED: Final[int] = 137
+# -----------------------------------------------------------------------------
+# correctness thresholds
+# -----------------------------------------------------------------------------
+
+# limits used for cross-library output verification
 DEFAULT_TOLERANCE: Final[int] = 3
 DEFAULT_MAE_LIMIT: Final[float] = 2.0
 DEFAULT_SSIM_LIMIT: Final[float] = 0.990
 
 
+# -----------------------------------------------------------------------------
+# configuration containers
+# -----------------------------------------------------------------------------
+
 @dataclass(frozen=True)
 class AugmentationProfile:
-    # High-level augmentation description shared by all backends.
-
+    # maximum transformation values shared by both libraries
     name: str
     description: str
     horizontal_flip: bool = False
@@ -35,16 +45,45 @@ class AugmentationProfile:
     blur_sigma: float = 0.0
 
 
-# These profiles use only operations implemented in every backend.
-# This keeps the comparison fair across Albumentations, Kornia and CuPy.
+@dataclass(frozen=True)
+class SampleParameters:
+    # concrete transformation values applied to one image
+    horizontal_flip: bool
+    vertical_flip: bool
+    angle_degrees: float
+    translate_x_fraction: float
+    translate_y_fraction: float
+    scale: float
+    brightness_delta: float
+    contrast_factor: float
+    blur_kernel: int
+    blur_sigma: float
+
+
+@dataclass(frozen=True)
+class BenchmarkPlan:
+    # complete benchmark matrix
+    name: str
+    profiles: tuple[str, ...]
+    workloads: tuple[tuple[int, tuple[int, ...]], ...]
+    thread_counts: tuple[int, ...]
+    repetitions: int
+    warmups: int
+
+
+# -----------------------------------------------------------------------------
+# augmentation profiles
+# -----------------------------------------------------------------------------
+
+# each profile uses operations implemented by Albumentations and Kornia
 PROFILES: Final[dict[str, AugmentationProfile]] = {
     "Identity": AugmentationProfile(
         name="Identity",
-        description="No augmentation. Measures framework, batching and transfer overhead.",
+        description="No augmentation. Measures framework and batching overhead.",
     ),
     "GeometricLight": AugmentationProfile(
         name="GeometricLight",
-        description="Horizontal flip, mild rotation, mild translation and mild rescaling.",
+        description="Horizontal flip with mild rotation, translation and rescaling.",
         horizontal_flip=True,
         angle_degrees=8.0,
         translate_fraction=0.05,
@@ -99,20 +138,11 @@ PROFILES: Final[dict[str, AugmentationProfile]] = {
 }
 
 
-@dataclass(frozen=True)
-class BenchmarkPlan:
-    # Complete benchmark plan
-    name: str
-    profiles: tuple[str, ...]
-    workloads: tuple[tuple[int, tuple[int, ...]], ...]
-    thread_counts: tuple[int, ...]
-    gpu_blocks: tuple[tuple[int, int], ...]
-    repetitions: int
-    warmups: int
+# -----------------------------------------------------------------------------
+# benchmark plan
+# -----------------------------------------------------------------------------
 
-
-# The project now exposes a single benchmark plan only.
-# Larger batch sizes are useful because Kornia and CUDA backends are naturally batch-oriented.
+# one complete run evaluates every profile, resolution, batch and worker count
 FULL_BENCHMARK_PLAN: Final[BenchmarkPlan] = BenchmarkPlan(
     name="Full",
     profiles=tuple(PROFILES.keys()),
@@ -122,23 +152,46 @@ FULL_BENCHMARK_PLAN: Final[BenchmarkPlan] = BenchmarkPlan(
         (2048, (1, 4, 8)),
     ),
     thread_counts=(1, 2, 4, 6, 8, 12),
-    gpu_blocks=(
-        (8, 8),
-        (16, 16),
-        (32, 8),
-        (8, 32),
-        (32, 16),
-        (16, 32),
-        (32, 32),
-        (256, 1),
-        (1, 256),
-    ),
     repetitions=5,
     warmups=2,
 )
 
 
+# -----------------------------------------------------------------------------
+# deterministic parameters
+# -----------------------------------------------------------------------------
+
+def parameters_for_sample(
+    profile: AugmentationProfile,
+    sample_index: int,
+) -> SampleParameters:
+    # alternate direction and magnitude using only the sample index
+    direction = -1.0 if sample_index % 2 else 1.0
+    secondary_direction = -1.0 if (sample_index // 2) % 2 else 1.0
+    # the cycle gives different strengths while remaining reproducible
+    magnitude_cycle = (1.0, 0.65, 0.35, 0.85)
+    magnitude = magnitude_cycle[sample_index % len(magnitude_cycle)]
+
+    # convert the profile maxima into the values used by this sample
+    return SampleParameters(
+        horizontal_flip=profile.horizontal_flip and sample_index % 2 == 0,
+        vertical_flip=profile.vertical_flip and sample_index % 3 == 0,
+        angle_degrees=profile.angle_degrees * direction * magnitude,
+        translate_x_fraction=profile.translate_fraction * direction * magnitude,
+        translate_y_fraction=(
+            profile.translate_fraction * secondary_direction * magnitude
+        ),
+        scale=1.0 + profile.scale_delta * secondary_direction * magnitude,
+        brightness_delta=profile.brightness_delta * direction * magnitude,
+        contrast_factor=(
+            1.0 + profile.contrast_delta * secondary_direction * magnitude
+        ),
+        blur_kernel=profile.blur_kernel,
+        blur_sigma=profile.blur_sigma,
+    )
+
+
 def ensure_output_directories() -> None:
-    # Create output folders used by the benchmark and preview modes.
+    # create the output folders before the menu starts
     RESULTS_ROOT.mkdir(parents=True, exist_ok=True)
     PREVIEWS_ROOT.mkdir(parents=True, exist_ok=True)

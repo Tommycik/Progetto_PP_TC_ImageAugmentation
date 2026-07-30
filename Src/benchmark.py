@@ -2,50 +2,43 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import csv
-from dataclasses import asdict
+from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
 import math
-import os
 from pathlib import Path
+import statistics
+import time
 from typing import Any, Callable
 
 import cv2
 import numpy as np
 import torch
 
-from .albumentations_backend import (
-    prepare_albumentations,
-    run_sequential,
-    run_threaded,
-)
-from .config import BenchmarkPlan, PROFILES, RESULTS_ROOT
-from .cupy_backend import (
-    apply_cupy_device,
-    clear_cupy_memory,
-    create_workspace,
-    cupy_cuda_available,
-    cupy_device_name,
-    cupy_to_host_float,
-    host_float_to_cupy,
-    host_float_to_numpy_batch,
-    launch_geometry,
-    numpy_float_batch,
-    prepare_cupy_parameters,
-    synchronize_cupy,
-    used_memory_mb,
-)
-from .image_io import build_batch
-from .kornia_backend import (
+from .backends import (
     apply_kornia,
     numpy_batch_to_tensor,
+    prepare_albumentations,
     prepare_kornia_parameters,
+    run_albumentations_sequential,
+    run_albumentations_threaded,
     tensor_to_numpy_batch,
 )
-from .metrics import ComparisonMetrics, compare_batches
-from .timing import TimingStatistics, measure
+from .config import (
+    BenchmarkPlan,
+    DEFAULT_MAE_LIMIT,
+    DEFAULT_SSIM_LIMIT,
+    DEFAULT_TOLERANCE,
+    PROFILES,
+    RESULTS_ROOT,
+)
 
 
+# -----------------------------------------------------------------------------
+# CSV schema
+# -----------------------------------------------------------------------------
+
+# every backend writes the same timing, speedup and correctness fields
 CSV_FIELDS = [
     "Timestamp",
     "Plan",
@@ -59,13 +52,6 @@ CSV_FIELDS = [
     "Device",
     "Workers",
     "Parameter",
-    "BlockX",
-    "BlockY",
-    "ThreadsPerBlock",
-    "GridX",
-    "GridY",
-    "GridZ",
-    "LaunchedThreads",
     "TimerScope",
     "Warmups",
     "Repetitions",
@@ -76,7 +62,9 @@ CSV_FIELDS = [
     "StdDev_ms",
     "CoefficientVariation_percent",
     "SequentialBaseline_ms",
-    "Speedup",
+    "BestCpu_ms",
+    "Speedup_vs_Sequential",
+    "Speedup_vs_BestCPU",
     "ParallelEfficiency",
     "Throughput_images_s",
     "Throughput_MPixels_s",
@@ -91,9 +79,6 @@ CSV_FIELDS = [
     "MaxDifference",
     "PSNR_dB",
     "GlobalSSIM",
-    "BlockReferenceExactMatch",
-    "BlockReferenceDifferentValues",
-    "BlockReferenceMaxDifference",
     "CudaAvailable",
     "GpuName",
     "CudaPeakMemory_MB",
@@ -111,6 +96,180 @@ CSV_FIELDS = [
 ]
 
 
+# -----------------------------------------------------------------------------
+# benchmark result containers
+# -----------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TimingStatistics:
+    # raw timing samples and their summary values
+    output: Any
+    samples_ms: tuple[float, ...]
+    mean_ms: float
+    median_ms: float
+    min_ms: float
+    max_ms: float
+    stddev_ms: float
+    coefficient_variation_percent: float
+
+
+@dataclass(frozen=True)
+class ComparisonMetrics:
+    # exact and numerical comparison between two image batches
+    exact_match: bool
+    tolerance_match: bool
+    different_values: int
+    different_pixels: int
+    mae: float
+    rmse: float
+    max_difference: float
+    psnr_db: float
+    global_ssim: float
+
+
+# -----------------------------------------------------------------------------
+# timing and correctness
+# -----------------------------------------------------------------------------
+
+def measure(
+    function: Callable[[], Any],
+    warmups: int,
+    repetitions: int,
+    synchronize: Callable[[], None] | None = None,
+) -> TimingStatistics:
+    # execute warm-ups before starting the measured repetitions
+    if repetitions < 1:
+        raise ValueError("At least one measured repetition is required.")
+
+    # keep the last output so timing and correctness use the same execution
+    output: Any = None
+    for _ in range(warmups):
+        output = function()
+        if synchronize is not None:
+            synchronize()
+
+    # perf_counter_ns provides a monotonic high-resolution host timer
+    samples: list[float] = []
+    for _ in range(repetitions):
+        start = time.perf_counter_ns()
+        output = function()
+        if synchronize is not None:
+            synchronize()
+        samples.append((time.perf_counter_ns() - start) / 1_000_000.0)
+
+    # calculate the same statistical values stored in the CSV
+    mean_ms = statistics.fmean(samples)
+    stddev_ms = statistics.pstdev(samples) if len(samples) > 1 else 0.0
+    coefficient = (stddev_ms / mean_ms * 100.0) if mean_ms > 0.0 else 0.0
+    return TimingStatistics(
+        output=output,
+        samples_ms=tuple(samples),
+        mean_ms=mean_ms,
+        median_ms=statistics.median(samples),
+        min_ms=min(samples),
+        max_ms=max(samples),
+        stddev_ms=stddev_ms,
+        coefficient_variation_percent=coefficient,
+    )
+
+
+def _global_ssim(reference: np.ndarray, candidate: np.ndarray) -> float:
+    # calculate one global SSIM score for every RGB channel
+    ref = reference.astype(np.float64) / 255.0
+    cand = candidate.astype(np.float64) / 255.0
+    c1 = 0.01**2
+    c2 = 0.03**2
+    scores: list[float] = []
+
+    for channel in range(ref.shape[-1]):
+        x = ref[..., channel].reshape(-1)
+        y = cand[..., channel].reshape(-1)
+        mu_x = float(x.mean())
+        mu_y = float(y.mean())
+        var_x = float(x.var())
+        var_y = float(y.var())
+        covariance = float(((x - mu_x) * (y - mu_y)).mean())
+        numerator = (2.0 * mu_x * mu_y + c1) * (2.0 * covariance + c2)
+        denominator = (mu_x * mu_x + mu_y * mu_y + c1) * (
+            var_x + var_y + c2
+        )
+        scores.append(numerator / denominator if denominator else 1.0)
+
+    return float(np.mean(scores))
+
+
+def compare_batches(
+    reference_images: list[np.ndarray],
+    candidate_images: list[np.ndarray],
+) -> ComparisonMetrics:
+    # compare equal-shaped batches using exact and perceptual measurements
+    if len(reference_images) != len(candidate_images):
+        return ComparisonMetrics(
+            False,
+            False,
+            -1,
+            -1,
+            math.inf,
+            math.inf,
+            math.inf,
+            0.0,
+            0.0,
+        )
+
+    reference = np.stack(reference_images).astype(np.float32)
+    candidate = np.stack(candidate_images).astype(np.float32)
+    if reference.shape != candidate.shape:
+        return ComparisonMetrics(
+            False,
+            False,
+            -1,
+            -1,
+            math.inf,
+            math.inf,
+            math.inf,
+            0.0,
+            0.0,
+        )
+
+    # calculate all pixel differences once and reuse them for every metric
+    absolute_difference = np.abs(reference - candidate)
+    squared_difference = np.square(reference - candidate)
+    mae = float(absolute_difference.mean())
+    rmse = float(np.sqrt(squared_difference.mean()))
+    max_difference = float(absolute_difference.max(initial=0.0))
+    different_values = int(np.count_nonzero(absolute_difference > 0.0))
+    different_pixels = int(
+        np.count_nonzero(np.any(absolute_difference > 0.0, axis=-1))
+    )
+    exact_match = different_values == 0
+    psnr = math.inf if rmse == 0.0 else 20.0 * math.log10(255.0 / rmse)
+    ssim = _global_ssim(
+        reference.astype(np.uint8),
+        candidate.astype(np.uint8),
+    )
+    # accept either a small maximum error or a low-MAE high-SSIM result
+    tolerance_match = (
+        max_difference <= DEFAULT_TOLERANCE
+        or (mae <= DEFAULT_MAE_LIMIT and ssim >= DEFAULT_SSIM_LIMIT)
+    )
+
+    return ComparisonMetrics(
+        exact_match=exact_match,
+        tolerance_match=tolerance_match,
+        different_values=different_values,
+        different_pixels=different_pixels,
+        mae=mae,
+        rmse=rmse,
+        max_difference=max_difference,
+        psnr_db=psnr,
+        global_ssim=ssim,
+    )
+
+
+# -----------------------------------------------------------------------------
+# CSV row helpers
+# -----------------------------------------------------------------------------
+
 def _timestamp() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -123,8 +282,8 @@ def _format_number(value: float | int | None) -> str:
     return f"{value:.6f}" if isinstance(value, float) else str(value)
 
 
-def _statistics_values(statistics: TimingStatistics[Any] | None) -> dict[str, str]:
-    if statistics is None:
+def _statistics_values(statistics_data: TimingStatistics | None) -> dict[str, str]:
+    if statistics_data is None:
         return {
             "TimeMean_ms": "",
             "TimeMedian_ms": "",
@@ -134,13 +293,13 @@ def _statistics_values(statistics: TimingStatistics[Any] | None) -> dict[str, st
             "CoefficientVariation_percent": "",
         }
     return {
-        "TimeMean_ms": _format_number(statistics.mean_ms),
-        "TimeMedian_ms": _format_number(statistics.median_ms),
-        "TimeMin_ms": _format_number(statistics.min_ms),
-        "TimeMax_ms": _format_number(statistics.max_ms),
-        "StdDev_ms": _format_number(statistics.stddev_ms),
+        "TimeMean_ms": _format_number(statistics_data.mean_ms),
+        "TimeMedian_ms": _format_number(statistics_data.median_ms),
+        "TimeMin_ms": _format_number(statistics_data.min_ms),
+        "TimeMax_ms": _format_number(statistics_data.max_ms),
+        "StdDev_ms": _format_number(statistics_data.stddev_ms),
         "CoefficientVariation_percent": _format_number(
-            statistics.coefficient_variation_percent
+            statistics_data.coefficient_variation_percent
         ),
     }
 
@@ -178,6 +337,7 @@ def _base_row(
     resolution: int,
     batch_size: int,
 ) -> dict[str, str]:
+    # fields shared by every backend in the current workload
     profile = PROFILES[profile_name]
     return {
         "Timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -212,17 +372,17 @@ def _result_row(
     timer_scope: str,
     warmups: int,
     repetitions: int,
-    statistics: TimingStatistics[Any] | None,
-    baseline_ms: float | None,
+    statistics_data: TimingStatistics | None,
+    sequential_ms: float,
+    best_cpu_ms: float,
     reference_backend: str,
     comparison_kind: str,
     metrics: ComparisonMetrics | None,
     peak_memory_mb: float | None = None,
-    block_geometry: Any | None = None,
-    block_reference_metrics: ComparisonMetrics | None = None,
     status: str = "SUCCESS",
     notes: str = "",
 ) -> dict[str, str]:
+    # start from an empty row so skipped backends keep the same schema
     row = {field: "" for field in CSV_FIELDS}
     row.update(base)
     row.update(
@@ -235,7 +395,8 @@ def _result_row(
             "TimerScope": timer_scope,
             "Warmups": str(warmups),
             "Repetitions": str(repetitions),
-            "SequentialBaseline_ms": _format_number(baseline_ms),
+            "SequentialBaseline_ms": _format_number(sequential_ms),
+            "BestCpu_ms": _format_number(best_cpu_ms),
             "ReferenceBackend": reference_backend,
             "ComparisonKind": comparison_kind,
             "CudaPeakMemory_MB": _format_number(peak_memory_mb),
@@ -243,71 +404,65 @@ def _result_row(
             "Notes": notes,
         }
     )
-    row.update(_statistics_values(statistics))
+    row.update(_statistics_values(statistics_data))
     row.update(_metric_values(metrics))
 
-    if block_geometry is not None:
-        row.update(
-            {
-                "BlockX": str(block_geometry.block_x),
-                "BlockY": str(block_geometry.block_y),
-                "ThreadsPerBlock": str(block_geometry.threads_per_block),
-                "GridX": str(block_geometry.grid_x),
-                "GridY": str(block_geometry.grid_y),
-                "GridZ": str(block_geometry.grid_z),
-                "LaunchedThreads": str(block_geometry.launched_threads),
-            }
-        )
-
-    if block_reference_metrics is not None:
-        row.update(
-            {
-                "BlockReferenceExactMatch": (
-                    "YES" if block_reference_metrics.exact_match else "NO"
-                ),
-                "BlockReferenceDifferentValues": str(
-                    block_reference_metrics.different_values
-                ),
-                "BlockReferenceMaxDifference": _format_number(
-                    block_reference_metrics.max_difference
-                ),
-            }
-        )
-
-    if statistics is not None and statistics.mean_ms > 0.0:
+    # derived speedup and throughput values require a valid measured mean
+    if statistics_data is not None and statistics_data.mean_ms > 0.0:
+        mean_ms = statistics_data.mean_ms
         batch_size = int(base["BatchSize"])
         resolution = int(base["Resolution"].split("x", maxsplit=1)[0])
-        speedup = baseline_ms / statistics.mean_ms if baseline_ms else 1.0
-        row["Speedup"] = _format_number(speedup)
-        row["Throughput_images_s"] = _format_number(batch_size * 1000.0 / statistics.mean_ms)
+        row["Speedup_vs_Sequential"] = _format_number(sequential_ms / mean_ms)
+        row["Speedup_vs_BestCPU"] = _format_number(best_cpu_ms / mean_ms)
+        row["Throughput_images_s"] = _format_number(batch_size * 1000.0 / mean_ms)
         row["Throughput_MPixels_s"] = _format_number(
-            batch_size * resolution * resolution / statistics.mean_ms / 1000.0
+            batch_size * resolution * resolution / mean_ms / 1000.0
         )
         if workers is not None and workers > 0:
-            row["ParallelEfficiency"] = _format_number(speedup / workers)
+            row["ParallelEfficiency"] = _format_number(
+                sequential_ms / mean_ms / workers
+            )
 
     return row
 
 
-def _write_row(writer: csv.DictWriter, file_handle: Any, row: dict[str, str]) -> None:
+def _write_row(
+    writer: csv.DictWriter,
+    file_handle: Any,
+    row: dict[str, str],
+) -> None:
+    # flush every row so completed workloads survive an interrupted run
     writer.writerow(row)
     file_handle.flush()
 
+
+# -----------------------------------------------------------------------------
+# complete benchmark execution
+# -----------------------------------------------------------------------------
 
 def run_benchmark(
     source_images: list[np.ndarray],
     input_source: str,
     plan: BenchmarkPlan,
+    build_batch: Callable[[list[np.ndarray], int, int], list[np.ndarray]],
 ) -> Path:
+    # execute every profile, resolution, batch and backend configuration
     cv2.setNumThreads(1)
-    result_path = RESULTS_ROOT / f"augmentation_benchmark_{plan.name.lower()}_{_timestamp()}.csv"
+    result_path = (
+        RESULTS_ROOT
+        / f"augmentation_benchmark_{plan.name.lower()}_{_timestamp()}.csv"
+    )
     result_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # devices are created once and reused by all workloads
+    cpu_device = torch.device("cpu")
     cuda_available = torch.cuda.is_available()
     cuda_device = torch.device("cuda:0") if cuda_available else None
-    cpu_device = torch.device("cpu")
-
-    total_workloads = sum(len(batch_sizes) for _, batch_sizes in plan.workloads) * len(plan.profiles)
+    # one workload is a profile, resolution and batch-size combination
+    total_workloads = (
+        sum(len(batch_sizes) for _, batch_sizes in plan.workloads)
+        * len(plan.profiles)
+    )
     workload_index = 0
 
     with result_path.open("w", newline="", encoding="utf-8-sig") as file_handle:
@@ -321,22 +476,81 @@ def run_benchmark(
                     workload_index += 1
                     print(
                         f"\n[{workload_index}/{total_workloads}] "
-                        f"Profile={profile_name}, Resolution={resolution}x{resolution}, "
+                        f"Profile={profile_name}, "
+                        f"Resolution={resolution}x{resolution}, "
                         f"Batch={batch_size}"
                     )
 
+                    # prepare the input batch before any timed backend call
                     images = build_batch(source_images, resolution, batch_size)
-                    prepared_alb = prepare_albumentations(profile, batch_size)
-                    base = _base_row(plan, input_source, profile_name, resolution, batch_size)
+                    prepared = prepare_albumentations(profile, batch_size)
+                    base = _base_row(
+                        plan,
+                        input_source,
+                        profile_name,
+                        resolution,
+                        batch_size,
+                    )
 
+                    # sequential Albumentations is the CPU correctness reference
+                    sequential_operation = partial(
+                        run_albumentations_sequential,
+                        images,
+                        prepared,
+                    )
                     sequential_stats = measure(
-                        lambda: run_sequential(images, prepared_alb),
+                        sequential_operation,
                         warmups=plan.warmups,
                         repetitions=plan.repetitions,
                     )
                     sequential_output = sequential_stats.output
-                    self_metrics = compare_batches(sequential_output, sequential_output)
-                    baseline_ms = sequential_stats.mean_ms
+                    sequential_ms = sequential_stats.mean_ms
+
+                    # store every worker result before writing the final CPU rows
+                    threaded_results: list[
+                        tuple[int, TimingStatistics, ComparisonMetrics]
+                    ] = []
+                    best_cpu_ms = sequential_ms
+                    best_cpu_output = sequential_output
+                    best_cpu_backend = "Albumentations_Sequential"
+                    best_cpu_workers = 1
+
+                    # test all requested ThreadPool sizes for this workload
+                    for workers in plan.thread_counts:
+                        with ThreadPoolExecutor(max_workers=workers) as executor:
+                            threaded_operation = partial(
+                                run_albumentations_threaded,
+                                images,
+                                prepared,
+                                executor,
+                            )
+                            threaded_stats = measure(
+                                threaded_operation,
+                                warmups=plan.warmups,
+                                repetitions=plan.repetitions,
+                            )
+                        threaded_metrics = compare_batches(
+                            sequential_output,
+                            threaded_stats.output,
+                        )
+                        threaded_results.append(
+                            (workers, threaded_stats, threaded_metrics)
+                        )
+                        # only an exact and faster result can replace the CPU reference
+                        if (
+                            threaded_metrics.exact_match
+                            and threaded_stats.mean_ms < best_cpu_ms
+                        ):
+                            best_cpu_ms = threaded_stats.mean_ms
+                            best_cpu_output = threaded_stats.output
+                            best_cpu_backend = "Albumentations_ThreadPool"
+                            best_cpu_workers = workers
+
+                    # write the sequential row after the best CPU time is known
+                    self_metrics = compare_batches(
+                        sequential_output,
+                        sequential_output,
+                    )
                     _write_row(
                         writer,
                         file_handle,
@@ -350,30 +564,18 @@ def run_benchmark(
                             timer_scope="AugmentationOnly",
                             warmups=plan.warmups,
                             repetitions=plan.repetitions,
-                            statistics=sequential_stats,
-                            baseline_ms=baseline_ms,
+                            statistics_data=sequential_stats,
+                            sequential_ms=sequential_ms,
+                            best_cpu_ms=best_cpu_ms,
                             reference_backend="Albumentations_Sequential",
                             comparison_kind="SelfReference",
                             metrics=self_metrics,
                             notes="OpenCV internal threads fixed to 1.",
                         ),
                     )
-                    print(f"  Sequential: {baseline_ms:.3f} ms")
 
-                    for workers in plan.thread_counts:
-                        with ThreadPoolExecutor(max_workers=workers) as executor:
-                            threaded_operation = partial(
-                                run_threaded,
-                                images,
-                                prepared_alb,
-                                executor,
-                            )
-                            threaded_stats = measure(
-                                threaded_operation,
-                                warmups=plan.warmups,
-                                repetitions=plan.repetitions,
-                            )
-                        threaded_metrics = compare_batches(sequential_output, threaded_stats.output)
+                    # write one CSV row for every measured worker count
+                    for workers, threaded_stats, threaded_metrics in threaded_results:
                         _write_row(
                             writer,
                             file_handle,
@@ -387,20 +589,25 @@ def run_benchmark(
                                 timer_scope="AugmentationOnly_PoolReused",
                                 warmups=plan.warmups,
                                 repetitions=plan.repetitions,
-                                statistics=threaded_stats,
-                                baseline_ms=baseline_ms,
+                                statistics_data=threaded_stats,
+                                sequential_ms=sequential_ms,
+                                best_cpu_ms=best_cpu_ms,
                                 reference_backend="Albumentations_Sequential",
                                 comparison_kind="SameLibrarySameParameters",
                                 metrics=threaded_metrics,
-                                notes="ThreadPool creation excluded; OpenCV internal threads fixed to 1.",
+                                notes=(
+                                    "Thread-pool creation excluded; "
+                                    "OpenCV internal threads fixed to 1."
+                                ),
                             ),
                         )
-                        print(
-                            f"  Threads {workers:2d}: {threaded_stats.mean_ms:.3f} ms, "
-                            f"speedup {baseline_ms / threaded_stats.mean_ms:.2f}x, "
-                            f"exact={threaded_metrics.exact_match}"
-                        )
 
+                    print(
+                        f"  Best CPU: {best_cpu_backend}, "
+                        f"workers={best_cpu_workers}, {best_cpu_ms:.3f} ms"
+                    )
+
+                    # Kornia CPU uses one pre-converted BCHW tensor
                     cpu_tensor = numpy_batch_to_tensor(images)
                     cpu_parameters = prepare_kornia_parameters(
                         profile,
@@ -409,13 +616,23 @@ def run_benchmark(
                         resolution,
                         cpu_device,
                     )
+                    kornia_cpu_operation = partial(
+                        apply_kornia,
+                        cpu_tensor,
+                        cpu_parameters,
+                    )
                     kornia_cpu_stats = measure(
-                        lambda: apply_kornia(cpu_tensor, cpu_parameters),
+                        kornia_cpu_operation,
                         warmups=plan.warmups,
                         repetitions=plan.repetitions,
                     )
-                    kornia_cpu_output = tensor_to_numpy_batch(kornia_cpu_stats.output)
-                    kornia_cpu_metrics = compare_batches(sequential_output, kornia_cpu_output)
+                    kornia_cpu_output = tensor_to_numpy_batch(
+                        kornia_cpu_stats.output
+                    )
+                    kornia_cpu_metrics = compare_batches(
+                        best_cpu_output,
+                        kornia_cpu_output,
+                    )
                     _write_row(
                         writer,
                         file_handle,
@@ -429,235 +646,30 @@ def run_benchmark(
                             timer_scope="TensorAugmentationOnly",
                             warmups=plan.warmups,
                             repetitions=plan.repetitions,
-                            statistics=kornia_cpu_stats,
-                            baseline_ms=baseline_ms,
-                            reference_backend="Albumentations_Sequential",
+                            statistics_data=kornia_cpu_stats,
+                            sequential_ms=sequential_ms,
+                            best_cpu_ms=best_cpu_ms,
+                            reference_backend=best_cpu_backend,
                             comparison_kind="CrossLibrarySameIntendedParameters",
                             metrics=kornia_cpu_metrics,
-                            notes="Tensor conversion excluded; PyTorch CPU threads fixed to 1.",
+                            notes=(
+                                "Tensor conversion excluded; "
+                                "PyTorch CPU threads fixed to 1."
+                            ),
                         ),
                     )
-                    print(
-                        f"  Kornia CPU: {kornia_cpu_stats.mean_ms:.3f} ms, "
-                        f"SSIM={kornia_cpu_metrics.global_ssim:.5f}"
-                    )
 
-                    # CuPy uses explicit RawKernel launches so block dimensions and
-                    # threads per block can be benchmarked directly from Python.
-                    reference_block = (16, 16) if (16, 16) in plan.gpu_blocks else plan.gpu_blocks[0]
-                    if not cupy_cuda_available():
-                        for block_x, block_y in plan.gpu_blocks:
-                            geometry = launch_geometry(
-                                resolution, resolution, batch_size, (block_x, block_y)
-                            )
-                            _write_row(
-                                writer,
-                                file_handle,
-                                _result_row(
-                                    base=base,
-                                    backend="CuPy_RawKernel_DeviceOnly",
-                                    library="CuPy RawKernel",
-                                    device="CUDA",
-                                    workers=None,
-                                    parameter=f"Block={block_x}x{block_y}",
-                                    timer_scope="DeviceAugmentationOnly",
-                                    warmups=plan.warmups,
-                                    repetitions=plan.repetitions,
-                                    statistics=None,
-                                    baseline_ms=baseline_ms,
-                                    reference_backend=f"CuPy_RawKernel_{reference_block[0]}x{reference_block[1]}",
-                                    comparison_kind="SameKernelDifferentBlock",
-                                    metrics=None,
-                                    block_geometry=geometry,
-                                    status="SKIPPED_NO_CUPY_CUDA",
-                                    notes="CuPy is missing or does not detect a CUDA device.",
-                                ),
-                            )
-                        print("  CuPy block tests skipped: CuPy CUDA is unavailable.")
-                    else:
-                        try:
-                            clear_cupy_memory()
-                            host_float_batch = numpy_float_batch(images)
-                            cupy_parameters = prepare_cupy_parameters(
-                                profile, batch_size, resolution, resolution
-                            )
-
-                            # End-to-end is measured once with the reference block.
-                            # Transfer time does not depend on the block geometry.
-                            reference_geometry = launch_geometry(
-                                resolution, resolution, batch_size, reference_block
-                            )
-
-                            def run_cupy_end_to_end() -> np.ndarray:
-                                device_input = host_float_to_cupy(host_float_batch)
-                                workspace = create_workspace(
-                                    batch_size, resolution, resolution
-                                )
-                                device_output = apply_cupy_device(
-                                    device_input, cupy_parameters, workspace, reference_block
-                                )
-                                return cupy_to_host_float(device_output)
-
-                            cupy_e2e_stats = measure(
-                                run_cupy_end_to_end,
-                                warmups=plan.warmups,
-                                repetitions=plan.repetitions,
-                                synchronize=synchronize_cupy,
-                            )
-                            cupy_e2e_output = host_float_to_numpy_batch(cupy_e2e_stats.output)
-                            cupy_e2e_metrics = compare_batches(
-                                sequential_output, cupy_e2e_output
-                            )
-                            _write_row(
-                                writer,
-                                file_handle,
-                                _result_row(
-                                    base=base,
-                                    backend="CuPy_RawKernel_EndToEnd",
-                                    library="CuPy RawKernel",
-                                    device="CUDA",
-                                    workers=None,
-                                    parameter=(
-                                        f"ReferenceBlock={reference_block[0]}x{reference_block[1]}"
-                                    ),
-                                    timer_scope=(
-                                        "HostToDevice+RawKernels+DeviceToHost"
-                                    ),
-                                    warmups=plan.warmups,
-                                    repetitions=plan.repetitions,
-                                    statistics=cupy_e2e_stats,
-                                    baseline_ms=baseline_ms,
-                                    reference_backend="Albumentations_Sequential",
-                                    comparison_kind=(
-                                        "CrossImplementationSameIntendedParameters"
-                                    ),
-                                    metrics=cupy_e2e_metrics,
-                                    peak_memory_mb=used_memory_mb(),
-                                    block_geometry=reference_geometry,
-                                    notes=(
-                                        "End-to-end CuPy measurement uses the reference block. "
-                                        "Block-size tests below exclude transfers."
-                                    ),
-                                ),
-                            )
-
-                            device_input = host_float_to_cupy(host_float_batch)
-                            reference_workspace = create_workspace(
-                                batch_size, resolution, resolution
-                            )
-                            reference_device_output = apply_cupy_device(
-                                device_input,
-                                cupy_parameters,
-                                reference_workspace,
-                                reference_block,
-                            )
-                            synchronize_cupy()
-                            reference_output = host_float_to_numpy_batch(
-                                cupy_to_host_float(reference_device_output)
-                            )
-
-                            for block_x, block_y in plan.gpu_blocks:
-                                current_block = (block_x, block_y)
-                                geometry = launch_geometry(
-                                    resolution, resolution, batch_size, current_block
-                                )
-                                current_workspace = create_workspace(
-                                    batch_size, resolution, resolution
-                                )
-                                cupy_operation = partial(
-                                    apply_cupy_device,
-                                    device_input,
-                                    cupy_parameters,
-                                    current_workspace,
-                                    current_block,
-                                )
-                                cupy_device_stats = measure(
-                                    cupy_operation,
-                                    warmups=plan.warmups,
-                                    repetitions=plan.repetitions,
-                                    synchronize=synchronize_cupy,
-                                )
-                                block_output = host_float_to_numpy_batch(
-                                    cupy_to_host_float(cupy_device_stats.output)
-                                )
-                                cross_metrics = compare_batches(
-                                    sequential_output, block_output
-                                )
-                                block_metrics = compare_batches(
-                                    reference_output, block_output
-                                )
-                                _write_row(
-                                    writer,
-                                    file_handle,
-                                    _result_row(
-                                        base=base,
-                                        backend="CuPy_RawKernel_DeviceOnly",
-                                        library="CuPy RawKernel",
-                                        device="CUDA",
-                                        workers=None,
-                                        parameter=f"Block={block_x}x{block_y}",
-                                        timer_scope="DeviceRawKernelsOnly",
-                                        warmups=plan.warmups,
-                                        repetitions=plan.repetitions,
-                                        statistics=cupy_device_stats,
-                                        baseline_ms=baseline_ms,
-                                        reference_backend=(
-                                            f"CuPy_RawKernel_{reference_block[0]}x{reference_block[1]}"
-                                        ),
-                                        comparison_kind="SameKernelDifferentBlock",
-                                        metrics=cross_metrics,
-                                        peak_memory_mb=used_memory_mb(),
-                                        block_geometry=geometry,
-                                        block_reference_metrics=block_metrics,
-                                        notes=(
-                                            "Main metrics compare with Albumentations. "
-                                            "BlockReference fields compare with the fixed CuPy reference block."
-                                        ),
-                                    ),
-                                )
-                                print(
-                                    f"  CuPy block {block_x:3d}x{block_y:<3d} "
-                                    f"({geometry.threads_per_block:4d} threads): "
-                                    f"{cupy_device_stats.mean_ms:.3f} ms, "
-                                    f"block_match={block_metrics.exact_match}"
-                                )
-                        except Exception as error:
-                            clear_cupy_memory()
-                            for block_x, block_y in plan.gpu_blocks:
-                                geometry = launch_geometry(
-                                    resolution, resolution, batch_size, (block_x, block_y)
-                                )
-                                _write_row(
-                                    writer,
-                                    file_handle,
-                                    _result_row(
-                                        base=base,
-                                        backend="CuPy_RawKernel_DeviceOnly",
-                                        library="CuPy RawKernel",
-                                        device="CUDA",
-                                        workers=None,
-                                        parameter=f"Block={block_x}x{block_y}",
-                                        timer_scope="DeviceRawKernelsOnly",
-                                        warmups=plan.warmups,
-                                        repetitions=plan.repetitions,
-                                        statistics=None,
-                                        baseline_ms=baseline_ms,
-                                        reference_backend=(
-                                            f"CuPy_RawKernel_{reference_block[0]}x{reference_block[1]}"
-                                        ),
-                                        comparison_kind="SameKernelDifferentBlock",
-                                        metrics=None,
-                                        block_geometry=geometry,
-                                        status="ERROR_CUPY",
-                                        notes=str(error).replace("\n", " "),
-                                    ),
-                                )
-                            print(f"  CuPy block tests failed: {error}")
-
+                    # keep two explicit skipped rows when CUDA is unavailable
                     if not cuda_available or cuda_device is None:
                         for backend, scope in (
-                            ("Kornia_CUDA_EndToEnd", "HostToDevice+Augmentation+DeviceToHost"),
-                            ("Kornia_CUDA_DeviceOnly", "DeviceAugmentationOnly"),
+                            (
+                                "Kornia_CUDA_EndToEnd",
+                                "HostToDevice+Augmentation+DeviceToHost",
+                            ),
+                            (
+                                "Kornia_CUDA_DeviceOnly",
+                                "DeviceAugmentationOnly",
+                            ),
                         ):
                             _write_row(
                                 writer,
@@ -672,19 +684,23 @@ def run_benchmark(
                                     timer_scope=scope,
                                     warmups=plan.warmups,
                                     repetitions=plan.repetitions,
-                                    statistics=None,
-                                    baseline_ms=baseline_ms,
-                                    reference_backend="Kornia_CPU_Batch",
-                                    comparison_kind="SameLibraryDifferentDevice",
+                                    statistics_data=None,
+                                    sequential_ms=sequential_ms,
+                                    best_cpu_ms=best_cpu_ms,
+                                    reference_backend=best_cpu_backend,
+                                    comparison_kind="SameWorkloadDifferentBackend",
                                     metrics=None,
                                     status="SKIPPED_NO_CUDA",
-                                    notes="torch.cuda.is_available() returned False.",
+                                    notes=(
+                                        "torch.cuda.is_available() returned False."
+                                    ),
                                 ),
                             )
-                        print("  CUDA skipped: PyTorch does not report an available CUDA device.")
+                        print("  Kornia CUDA skipped: no CUDA device detected.")
                         continue
 
                     try:
+                        # clear cached blocks and reset peak-memory tracking
                         torch.cuda.empty_cache()
                         torch.cuda.reset_peak_memory_stats(cuda_device)
                         gpu_parameters = prepare_kornia_parameters(
@@ -695,6 +711,7 @@ def run_benchmark(
                             cuda_device,
                         )
 
+                        # end-to-end timing includes both transfers and augmentation
                         def run_cuda_end_to_end() -> torch.Tensor:
                             gpu_input = cpu_tensor.to(cuda_device)
                             gpu_output = apply_kornia(gpu_input, gpu_parameters)
@@ -706,9 +723,17 @@ def run_benchmark(
                             repetitions=plan.repetitions,
                             synchronize=torch.cuda.synchronize,
                         )
-                        cuda_e2e_output = tensor_to_numpy_batch(cuda_e2e_stats.output)
-                        cuda_e2e_metrics = compare_batches(sequential_output, cuda_e2e_output)
-                        peak_memory_mb = torch.cuda.max_memory_allocated(cuda_device) / (1024.0 ** 2)
+                        cuda_e2e_output = tensor_to_numpy_batch(
+                            cuda_e2e_stats.output
+                        )
+                        cuda_e2e_metrics = compare_batches(
+                            best_cpu_output,
+                            cuda_e2e_output,
+                        )
+                        peak_e2e_memory = (
+                            torch.cuda.max_memory_allocated(cuda_device)
+                            / (1024.0**2)
+                        )
                         _write_row(
                             writer,
                             file_handle,
@@ -719,31 +744,53 @@ def run_benchmark(
                                 device="CUDA",
                                 workers=None,
                                 parameter="VectorizedBatch",
-                                timer_scope="HostToDevice+Augmentation+DeviceToHost",
+                                timer_scope=(
+                                    "HostToDevice+Augmentation+DeviceToHost"
+                                ),
                                 warmups=plan.warmups,
                                 repetitions=plan.repetitions,
-                                statistics=cuda_e2e_stats,
-                                baseline_ms=baseline_ms,
-                                reference_backend="Albumentations_Sequential",
-                                comparison_kind="CrossLibrarySameIntendedParameters",
+                                statistics_data=cuda_e2e_stats,
+                                sequential_ms=sequential_ms,
+                                best_cpu_ms=best_cpu_ms,
+                                reference_backend=best_cpu_backend,
+                                comparison_kind=(
+                                    "CrossLibrarySameIntendedParameters"
+                                ),
                                 metrics=cuda_e2e_metrics,
-                                peak_memory_mb=peak_memory_mb,
-                                notes="Directly comparable end-to-end CUDA scope.",
+                                peak_memory_mb=peak_e2e_memory,
+                                notes=(
+                                    "Complete CUDA path directly compared "
+                                    "with the fastest valid CPU result."
+                                ),
                             ),
                         )
 
+                        # device-only timing reuses an input already stored on the GPU
                         gpu_input = cpu_tensor.to(cuda_device)
                         torch.cuda.synchronize()
                         torch.cuda.reset_peak_memory_stats(cuda_device)
+                        cuda_device_operation = partial(
+                            apply_kornia,
+                            gpu_input,
+                            gpu_parameters,
+                        )
                         cuda_device_stats = measure(
-                            lambda: apply_kornia(gpu_input, gpu_parameters),
+                            cuda_device_operation,
                             warmups=plan.warmups,
                             repetitions=plan.repetitions,
                             synchronize=torch.cuda.synchronize,
                         )
-                        cuda_device_output = tensor_to_numpy_batch(cuda_device_stats.output)
-                        cuda_device_metrics = compare_batches(kornia_cpu_output, cuda_device_output)
-                        peak_device_memory_mb = torch.cuda.max_memory_allocated(cuda_device) / (1024.0 ** 2)
+                        cuda_device_output = tensor_to_numpy_batch(
+                            cuda_device_stats.output
+                        )
+                        cuda_device_metrics = compare_batches(
+                            kornia_cpu_output,
+                            cuda_device_output,
+                        )
+                        peak_device_memory = (
+                            torch.cuda.max_memory_allocated(cuda_device)
+                            / (1024.0**2)
+                        )
                         _write_row(
                             writer,
                             file_handle,
@@ -757,31 +804,42 @@ def run_benchmark(
                                 timer_scope="DeviceAugmentationOnly",
                                 warmups=plan.warmups,
                                 repetitions=plan.repetitions,
-                                statistics=cuda_device_stats,
-                                baseline_ms=baseline_ms,
+                                statistics_data=cuda_device_stats,
+                                sequential_ms=sequential_ms,
+                                best_cpu_ms=best_cpu_ms,
                                 reference_backend="Kornia_CPU_Batch",
                                 comparison_kind="SameLibraryDifferentDevice",
                                 metrics=cuda_device_metrics,
-                                peak_memory_mb=peak_device_memory_mb,
-                                notes="Input already on GPU; use separately from end-to-end speedup.",
+                                peak_memory_mb=peak_device_memory,
+                                notes=(
+                                    "Input already resident on the GPU; "
+                                    "transfer costs excluded."
+                                ),
                             ),
                         )
                         print(
-                            f"  CUDA E2E: {cuda_e2e_stats.mean_ms:.3f} ms, "
-                            f"speedup {baseline_ms / cuda_e2e_stats.mean_ms:.2f}x, "
-                            f"SSIM={cuda_e2e_metrics.global_ssim:.5f}"
+                            f"  Kornia CUDA E2E: "
+                            f"{cuda_e2e_stats.mean_ms:.3f} ms, "
+                            f"best-CPU/GPU={best_cpu_ms / cuda_e2e_stats.mean_ms:.2f}x"
                         )
                         print(
-                            f"  CUDA device: {cuda_device_stats.mean_ms:.3f} ms, "
-                            f"CPU/GPU exact={cuda_device_metrics.exact_match}"
+                            f"  Kornia CUDA device-only: "
+                            f"{cuda_device_stats.mean_ms:.3f} ms"
                         )
                     except RuntimeError as error:
+                        # only CUDA out-of-memory errors are converted to skipped rows
                         if "out of memory" not in str(error).lower():
                             raise
                         torch.cuda.empty_cache()
                         for backend, scope in (
-                            ("Kornia_CUDA_EndToEnd", "HostToDevice+Augmentation+DeviceToHost"),
-                            ("Kornia_CUDA_DeviceOnly", "DeviceAugmentationOnly"),
+                            (
+                                "Kornia_CUDA_EndToEnd",
+                                "HostToDevice+Augmentation+DeviceToHost",
+                            ),
+                            (
+                                "Kornia_CUDA_DeviceOnly",
+                                "DeviceAugmentationOnly",
+                            ),
                         ):
                             _write_row(
                                 writer,
@@ -796,16 +854,17 @@ def run_benchmark(
                                     timer_scope=scope,
                                     warmups=plan.warmups,
                                     repetitions=plan.repetitions,
-                                    statistics=None,
-                                    baseline_ms=baseline_ms,
-                                    reference_backend="Kornia_CPU_Batch",
-                                    comparison_kind="SameLibraryDifferentDevice",
+                                    statistics_data=None,
+                                    sequential_ms=sequential_ms,
+                                    best_cpu_ms=best_cpu_ms,
+                                    reference_backend=best_cpu_backend,
+                                    comparison_kind="SameWorkloadDifferentBackend",
                                     metrics=None,
                                     status="SKIPPED_CUDA_OOM",
                                     notes=str(error).replace("\n", " "),
                                 ),
                             )
-                        print("  CUDA skipped for this workload: insufficient GPU memory.")
+                        print("  Kornia CUDA skipped: insufficient GPU memory.")
 
     print(f"\nBenchmark completed. CSV saved to:\n{result_path}")
     return result_path
