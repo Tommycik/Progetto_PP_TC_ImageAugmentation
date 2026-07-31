@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from functools import partial
 import os
 from pathlib import Path
 import platform
@@ -17,14 +16,10 @@ from PIL import Image, ImageDraw
 import torch
 
 from .backends import (
-    apply_kornia,
-    numpy_batch_to_tensor,
     prepare_albumentations,
-    prepare_kornia_parameters,
     run_albumentations_threaded,
-    tensor_to_numpy_batch,
 )
-from .benchmark import measure, run_benchmark
+from .benchmark import run_benchmark
 from .config import (
     FULL_BENCHMARK_PLAN,
     PREVIEWS_ROOT,
@@ -56,10 +51,11 @@ def _configure_runtime() -> None:
     # one OpenCV thread prevents nested parallelism inside each worker
     cv2.setNumThreads(1)
 
-    # one PyTorch CPU thread keeps the Kornia CPU path controlled
+    # one thread is the default outside measurements. The benchmark uses
+    # PyTorch Timer to apply each configured intra-operation thread count.
     torch.set_num_threads(1)
     try:
-        # execute one independent PyTorch CPU operation at a time
+        # keep inter-operation scheduling fixed while intra-operation threads vary
         torch.set_num_interop_threads(1)
     except RuntimeError:
         # PyTorch may reject the change after its thread system is initialized.
@@ -208,132 +204,58 @@ def _make_contact_sheet(
 
 
 # -----------------------------------------------------------------------------
-# automatic preview
+# preview generation
 # -----------------------------------------------------------------------------
 
-def _generate_automatic_preview(source_images: list[np.ndarray]) -> Path:
-    # fixed preview workload used without additional console questions
+def _generate_preview(source_images: list[np.ndarray]) -> Path:
+    # Use one fixed and predictable preview configuration.
     profile_name = "MixedStrong"
     resolution = 512
     batch_size = 8
+    worker_count = 8
+
+    # Build the same deterministic batch used by the preview.
     profile = PROFILES[profile_name]
     images = _build_batch(source_images, resolution, batch_size)
-    candidates: list[tuple[str, float, list[np.ndarray]]] = []
-
-    # measure the multithread Albumentations complete path
     prepared = prepare_albumentations(profile, batch_size)
-    worker_count = min(12, batch_size)
+
+    # Apply Albumentations with exactly eight CPU workers.
+    # No benchmark or backend search is performed in preview mode.
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        alb_operation = partial(
-            run_albumentations_threaded,
+        preview_images = run_albumentations_threaded(
             images,
             prepared,
             executor,
         )
-        alb_stats = measure(alb_operation, warmups=1, repetitions=3)
-    candidates.append(
-        (
-            f"Albumentations {worker_count} threads",
-            alb_stats.mean_ms,
-            alb_stats.output,
-        )
-    )
 
-    # measure the Kornia complete path on the CPU
-    cpu_device = torch.device("cpu")
-    cpu_parameters = prepare_kornia_parameters(
-        profile,
-        batch_size,
-        resolution,
-        resolution,
-        cpu_device,
-    )
-
-    def run_kornia_cpu_complete() -> list[np.ndarray]:
-        tensor = numpy_batch_to_tensor(images)
-        return tensor_to_numpy_batch(apply_kornia(tensor, cpu_parameters))
-
-    kornia_cpu_stats = measure(
-        run_kornia_cpu_complete,
-        warmups=1,
-        repetitions=3,
-    )
-    candidates.append(
-        (
-            "Kornia CPU",
-            kornia_cpu_stats.mean_ms,
-            kornia_cpu_stats.output,
-        )
-    )
-
-    # add the complete CUDA path when PyTorch detects the GPU
-    if torch.cuda.is_available():
-        cuda_device = torch.device("cuda:0")
-        cuda_parameters = prepare_kornia_parameters(
-            profile,
-            batch_size,
-            resolution,
-            resolution,
-            cuda_device,
-        )
-
-        def run_kornia_cuda_complete() -> list[np.ndarray]:
-            cpu_tensor = numpy_batch_to_tensor(images)
-            gpu_output = apply_kornia(
-                cpu_tensor.to(cuda_device),
-                cuda_parameters,
-            )
-            return tensor_to_numpy_batch(gpu_output.to(cpu_device))
-
-        cuda_stats = measure(
-            run_kornia_cuda_complete,
-            warmups=1,
-            repetitions=3,
-            synchronize=torch.cuda.synchronize,
-        )
-        candidates.append(
-            (
-                "Kornia CUDA end-to-end",
-                cuda_stats.mean_ms,
-                cuda_stats.output,
-            )
-        )
-
-    # select the lowest measured complete-path mean
-    chosen_label, chosen_time, preview_images = min(
-        candidates,
-        key=lambda item: item[1],
-    )
-    print("\nAutomatic preview comparison:")
-    for label, mean_ms, _ in candidates:
-        print(f"  {label}: {mean_ms:.3f} ms")
-    print(f"Selected backend: {chosen_label}")
+    print("\nPreview backend: Albumentations")
+    print(f"CPU workers: {worker_count}")
     print(
         f"Parameters: profile={profile_name}, resolution={resolution}, "
         f"batch={batch_size}"
     )
 
-    # create a separate timestamped directory for every preview
+    # Create a separate timestamped directory for every preview.
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_directory = (
         PREVIEWS_ROOT
         / f"{timestamp}_{profile_name}_{resolution}_batch{batch_size}"
     )
-    # save the original batch first
+
+    # Save the original batch and the augmented result.
     for index, image in enumerate(images):
         _save_rgb_image(
             output_directory / "input" / f"image_{index:02d}.png",
             image,
         )
-    # use a file-system-safe backend folder name
-    safe_label = chosen_label.lower().replace(" ", "_").replace("-", "_")
     for index, image in enumerate(preview_images):
         _save_rgb_image(
-            output_directory / safe_label / f"image_{index:02d}.png",
+            output_directory / "albumentations_8_threads" / f"image_{index:02d}.png",
             image,
         )
+
     _make_contact_sheet(
-        [("Input", images), (chosen_label, preview_images)],
+        [("Input", images), ("Albumentations 8 threads", preview_images)],
         output_directory / "contact_sheet.png",
     )
 
@@ -361,6 +283,8 @@ def _environment_report() -> None:
     print(f"OpenCV: {cv2.__version__}")
     print(f"Albumentations: {albumentations.__version__}")
     print(f"PyTorch: {torch.__version__}")
+    print(f"PyTorch default intra-op threads: {torch.get_num_threads()}")
+    print(f"PyTorch inter-op threads: {torch.get_num_interop_threads()}")
     print(f"Kornia: {kornia.__version__}")
     print(f"CUDA available through PyTorch: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
@@ -384,7 +308,7 @@ def run_application() -> None:
 
     while True:
         print("\n1. Full benchmark")
-        print("2. Generate automatic preview")
+        print("2. Generate preview")
         print("3. Check environment")
         print("4. Exit")
         choice = input("Selection: ").strip()
@@ -400,9 +324,9 @@ def run_application() -> None:
                     _build_batch,
                 )
             elif choice == "2":
-                # generate one preview with the fastest measured backend
+                # generate one fixed Albumentations preview with eight workers
                 images, _ = _read_source_images()
-                _generate_automatic_preview(images)
+                _generate_preview(images)
             elif choice == "3":
                 # show the runtime configuration before a long benchmark
                 _environment_report()

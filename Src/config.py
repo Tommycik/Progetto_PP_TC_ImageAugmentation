@@ -142,7 +142,7 @@ PROFILES: Final[dict[str, AugmentationProfile]] = {
 # benchmark plan
 # -----------------------------------------------------------------------------
 
-# one complete run evaluates every profile, resolution, batch and worker count
+# one complete run evaluates every profile, resolution, batch and CPU thread count
 FULL_BENCHMARK_PLAN: Final[BenchmarkPlan] = BenchmarkPlan(
     name="Full",
     profiles=tuple(PROFILES.keys()),
@@ -151,6 +151,7 @@ FULL_BENCHMARK_PLAN: Final[BenchmarkPlan] = BenchmarkPlan(
         (1024, (1, 4, 8, 16, 32)),
         (2048, (1, 4, 8)),
     ),
+    # used by Albumentations workers and Kornia/PyTorch intra-op threads
     thread_counts=(1, 2, 4, 6, 8, 12),
     repetitions=5,
     warmups=2,

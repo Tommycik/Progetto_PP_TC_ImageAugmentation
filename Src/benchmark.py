@@ -14,6 +14,7 @@ from typing import Any, Callable
 import cv2
 import numpy as np
 import torch
+from torch.utils import benchmark as torch_benchmark
 
 from .backends import (
     apply_kornia,
@@ -65,6 +66,8 @@ CSV_FIELDS = [
     "BestCpu_ms",
     "Speedup_vs_Sequential",
     "Speedup_vs_BestCPU",
+    "ParallelBaseline_ms",
+    "ParallelSpeedup",
     "ParallelEfficiency",
     "Throughput_images_s",
     "Throughput_MPixels_s",
@@ -163,6 +166,56 @@ def measure(
     coefficient = (stddev_ms / mean_ms * 100.0) if mean_ms > 0.0 else 0.0
     return TimingStatistics(
         output=output,
+        samples_ms=tuple(samples),
+        mean_ms=mean_ms,
+        median_ms=statistics.median(samples),
+        min_ms=min(samples),
+        max_ms=max(samples),
+        stddev_ms=stddev_ms,
+        coefficient_variation_percent=coefficient,
+    )
+
+
+def measure_torch_cpu(
+    function: Callable[[], Any],
+    threads: int,
+    warmups: int,
+    repetitions: int,
+) -> TimingStatistics:
+    # PyTorch Timer applies the requested intra-operation thread-pool size
+    # only while the Kornia CPU operation is measured.
+    if threads < 1:
+        raise ValueError("PyTorch CPU thread count must be positive.")
+    if repetitions < 1:
+        raise ValueError("At least one measured repetition is required.")
+
+    # The mutable holder keeps the output of the last timed execution so the
+    # same measured result can also be used for correctness verification.
+    output_holder: dict[str, Any] = {"value": None}
+
+    def execute_and_store() -> None:
+        output_holder["value"] = function()
+
+    timer = torch_benchmark.Timer(
+        stmt="execute_and_store()",
+        globals={"execute_and_store": execute_and_store},
+        num_threads=threads,
+    )
+
+    # Explicit warm-ups initialize lazy operators before the stored samples.
+    for _ in range(warmups):
+        timer.timeit(number=1)
+
+    samples = [
+        timer.timeit(number=1).mean * 1000.0
+        for _ in range(repetitions)
+    ]
+    mean_ms = statistics.fmean(samples)
+    stddev_ms = statistics.pstdev(samples) if len(samples) > 1 else 0.0
+    coefficient = (stddev_ms / mean_ms * 100.0) if mean_ms > 0.0 else 0.0
+
+    return TimingStatistics(
+        output=output_holder["value"],
         samples_ms=tuple(samples),
         mean_ms=mean_ms,
         median_ms=statistics.median(samples),
@@ -375,6 +428,7 @@ def _result_row(
     statistics_data: TimingStatistics | None,
     sequential_ms: float,
     best_cpu_ms: float,
+    parallel_baseline_ms: float | None,
     reference_backend: str,
     comparison_kind: str,
     metrics: ComparisonMetrics | None,
@@ -397,6 +451,7 @@ def _result_row(
             "Repetitions": str(repetitions),
             "SequentialBaseline_ms": _format_number(sequential_ms),
             "BestCpu_ms": _format_number(best_cpu_ms),
+            "ParallelBaseline_ms": _format_number(parallel_baseline_ms),
             "ReferenceBackend": reference_backend,
             "ComparisonKind": comparison_kind,
             "CudaPeakMemory_MB": _format_number(peak_memory_mb),
@@ -418,10 +473,13 @@ def _result_row(
         row["Throughput_MPixels_s"] = _format_number(
             batch_size * resolution * resolution / mean_ms / 1000.0
         )
-        if workers is not None and workers > 0:
-            row["ParallelEfficiency"] = _format_number(
-                sequential_ms / mean_ms / workers
-            )
+        if parallel_baseline_ms is not None and parallel_baseline_ms > 0.0:
+            parallel_speedup = parallel_baseline_ms / mean_ms
+            row["ParallelSpeedup"] = _format_number(parallel_speedup)
+            if workers is not None and workers > 0:
+                row["ParallelEfficiency"] = _format_number(
+                    parallel_speedup / workers
+                )
 
     return row
 
@@ -446,7 +504,7 @@ def run_benchmark(
     plan: BenchmarkPlan,
     build_batch: Callable[[list[np.ndarray], int, int], list[np.ndarray]],
 ) -> Path:
-    # execute every profile, resolution, batch and backend configuration
+    # Execute every profile, resolution, batch and backend configuration.
     cv2.setNumThreads(1)
     result_path = (
         RESULTS_ROOT
@@ -454,11 +512,11 @@ def run_benchmark(
     )
     result_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # devices are created once and reused by all workloads
+    # Kornia uses the same operators on CPU and CUDA. CPU rows vary the
+    # PyTorch intra-operation thread count, while CUDA rows vary timing scope.
     cpu_device = torch.device("cpu")
     cuda_available = torch.cuda.is_available()
     cuda_device = torch.device("cuda:0") if cuda_available else None
-    # one workload is a profile, resolution and batch-size combination
     total_workloads = (
         sum(len(batch_sizes) for _, batch_sizes in plan.workloads)
         * len(plan.profiles)
@@ -481,7 +539,7 @@ def run_benchmark(
                         f"Batch={batch_size}"
                     )
 
-                    # prepare the input batch before any timed backend call
+                    # Prepare the common input before any timed backend call.
                     images = build_batch(source_images, resolution, batch_size)
                     prepared = prepare_albumentations(profile, batch_size)
                     base = _base_row(
@@ -492,7 +550,7 @@ def run_benchmark(
                         batch_size,
                     )
 
-                    # sequential Albumentations is the CPU correctness reference
+                    # Albumentations sequential is the stable image reference.
                     sequential_operation = partial(
                         run_albumentations_sequential,
                         images,
@@ -506,16 +564,10 @@ def run_benchmark(
                     sequential_output = sequential_stats.output
                     sequential_ms = sequential_stats.mean_ms
 
-                    # store every worker result before writing the final CPU rows
+                    # Measure every Albumentations ThreadPool worker count.
                     threaded_results: list[
                         tuple[int, TimingStatistics, ComparisonMetrics]
                     ] = []
-                    best_cpu_ms = sequential_ms
-                    best_cpu_output = sequential_output
-                    best_cpu_backend = "Albumentations_Sequential"
-                    best_cpu_workers = 1
-
-                    # test all requested ThreadPool sizes for this workload
                     for workers in plan.thread_counts:
                         with ThreadPoolExecutor(max_workers=workers) as executor:
                             threaded_operation = partial(
@@ -536,17 +588,86 @@ def run_benchmark(
                         threaded_results.append(
                             (workers, threaded_stats, threaded_metrics)
                         )
-                        # only an exact and faster result can replace the CPU reference
-                        if (
-                            threaded_metrics.exact_match
-                            and threaded_stats.mean_ms < best_cpu_ms
-                        ):
-                            best_cpu_ms = threaded_stats.mean_ms
-                            best_cpu_output = threaded_stats.output
+
+                    # Convert the batch once because Kornia CPU timing covers only
+                    # tensor augmentation, exactly like the previous CPU scope.
+                    cpu_tensor = numpy_batch_to_tensor(images)
+                    cpu_parameters = prepare_kornia_parameters(
+                        profile,
+                        batch_size,
+                        resolution,
+                        resolution,
+                        cpu_device,
+                    )
+                    kornia_cpu_operation = partial(
+                        apply_kornia,
+                        cpu_tensor,
+                        cpu_parameters,
+                    )
+
+                    # PyTorch Timer controls the intra-operation thread pool for
+                    # each Kornia CPU measurement without changing the algorithm.
+                    kornia_cpu_results: list[
+                        tuple[
+                            int,
+                            TimingStatistics,
+                            list[np.ndarray],
+                            ComparisonMetrics,
+                        ]
+                    ] = []
+                    for threads in plan.thread_counts:
+                        kornia_stats = measure_torch_cpu(
+                            kornia_cpu_operation,
+                            threads=threads,
+                            warmups=plan.warmups,
+                            repetitions=plan.repetitions,
+                        )
+                        kornia_output = tensor_to_numpy_batch(kornia_stats.output)
+                        kornia_metrics = compare_batches(
+                            sequential_output,
+                            kornia_output,
+                        )
+                        kornia_cpu_results.append(
+                            (threads, kornia_stats, kornia_output, kornia_metrics)
+                        )
+
+                    # The one-thread Kornia row is its own scaling baseline.
+                    kornia_one_thread = next(
+                        (
+                            result
+                            for result in kornia_cpu_results
+                            if result[0] == 1
+                        ),
+                        None,
+                    )
+                    if kornia_one_thread is None:
+                        raise ValueError(
+                            "Kornia CPU scaling requires thread_counts to include 1."
+                        )
+                    kornia_one_thread_ms = kornia_one_thread[1].mean_ms
+                    kornia_reference_output = kornia_one_thread[2]
+
+                    # Select the fastest correct CPU result across both libraries.
+                    best_cpu_ms = sequential_ms
+                    best_cpu_output = sequential_output
+                    best_cpu_backend = "Albumentations_Sequential"
+                    best_cpu_workers = 1
+
+                    for workers, stats, metrics in threaded_results:
+                        if metrics.exact_match and stats.mean_ms < best_cpu_ms:
+                            best_cpu_ms = stats.mean_ms
+                            best_cpu_output = stats.output
                             best_cpu_backend = "Albumentations_ThreadPool"
                             best_cpu_workers = workers
 
-                    # write the sequential row after the best CPU time is known
+                    for threads, stats, output, metrics in kornia_cpu_results:
+                        if metrics.tolerance_match and stats.mean_ms < best_cpu_ms:
+                            best_cpu_ms = stats.mean_ms
+                            best_cpu_output = output
+                            best_cpu_backend = "Kornia_CPU_Batch"
+                            best_cpu_workers = threads
+
+                    # Write the CPU rows only after the global best CPU is known.
                     self_metrics = compare_batches(
                         sequential_output,
                         sequential_output,
@@ -567,6 +688,7 @@ def run_benchmark(
                             statistics_data=sequential_stats,
                             sequential_ms=sequential_ms,
                             best_cpu_ms=best_cpu_ms,
+                            parallel_baseline_ms=sequential_ms,
                             reference_backend="Albumentations_Sequential",
                             comparison_kind="SelfReference",
                             metrics=self_metrics,
@@ -574,8 +696,7 @@ def run_benchmark(
                         ),
                     )
 
-                    # write one CSV row for every measured worker count
-                    for workers, threaded_stats, threaded_metrics in threaded_results:
+                    for workers, stats, metrics in threaded_results:
                         _write_row(
                             writer,
                             file_handle,
@@ -589,12 +710,13 @@ def run_benchmark(
                                 timer_scope="AugmentationOnly_PoolReused",
                                 warmups=plan.warmups,
                                 repetitions=plan.repetitions,
-                                statistics_data=threaded_stats,
+                                statistics_data=stats,
                                 sequential_ms=sequential_ms,
                                 best_cpu_ms=best_cpu_ms,
+                                parallel_baseline_ms=sequential_ms,
                                 reference_backend="Albumentations_Sequential",
                                 comparison_kind="SameLibrarySameParameters",
-                                metrics=threaded_metrics,
+                                metrics=metrics,
                                 notes=(
                                     "Thread-pool creation excluded; "
                                     "OpenCV internal threads fixed to 1."
@@ -602,64 +724,43 @@ def run_benchmark(
                             ),
                         )
 
+                    for threads, stats, _output, metrics in kornia_cpu_results:
+                        _write_row(
+                            writer,
+                            file_handle,
+                            _result_row(
+                                base=base,
+                                backend="Kornia_CPU_Batch",
+                                library="Kornia/PyTorch",
+                                device="CPU",
+                                workers=threads,
+                                parameter=f"IntraOpThreads={threads}",
+                                timer_scope="TensorAugmentationOnly",
+                                warmups=plan.warmups,
+                                repetitions=plan.repetitions,
+                                statistics_data=stats,
+                                sequential_ms=sequential_ms,
+                                best_cpu_ms=best_cpu_ms,
+                                parallel_baseline_ms=kornia_one_thread_ms,
+                                reference_backend="Albumentations_Sequential",
+                                comparison_kind="CrossLibrarySameIntendedParameters",
+                                metrics=metrics,
+                                notes=(
+                                    "Tensor conversion excluded; PyTorch Timer "
+                                    "sets the intra-operation thread count; "
+                                    "inter-operation threads fixed to 1."
+                                ),
+                            ),
+                        )
+
                     print(
                         f"  Best CPU: {best_cpu_backend}, "
-                        f"workers={best_cpu_workers}, {best_cpu_ms:.3f} ms"
+                        f"threads={best_cpu_workers}, {best_cpu_ms:.3f} ms"
                     )
 
-                    # Kornia CPU uses one pre-converted BCHW tensor
-                    cpu_tensor = numpy_batch_to_tensor(images)
-                    cpu_parameters = prepare_kornia_parameters(
-                        profile,
-                        batch_size,
-                        resolution,
-                        resolution,
-                        cpu_device,
-                    )
-                    kornia_cpu_operation = partial(
-                        apply_kornia,
-                        cpu_tensor,
-                        cpu_parameters,
-                    )
-                    kornia_cpu_stats = measure(
-                        kornia_cpu_operation,
-                        warmups=plan.warmups,
-                        repetitions=plan.repetitions,
-                    )
-                    kornia_cpu_output = tensor_to_numpy_batch(
-                        kornia_cpu_stats.output
-                    )
-                    kornia_cpu_metrics = compare_batches(
-                        best_cpu_output,
-                        kornia_cpu_output,
-                    )
-                    _write_row(
-                        writer,
-                        file_handle,
-                        _result_row(
-                            base=base,
-                            backend="Kornia_CPU_Batch",
-                            library="Kornia/PyTorch",
-                            device="CPU",
-                            workers=1,
-                            parameter="VectorizedBatch",
-                            timer_scope="TensorAugmentationOnly",
-                            warmups=plan.warmups,
-                            repetitions=plan.repetitions,
-                            statistics_data=kornia_cpu_stats,
-                            sequential_ms=sequential_ms,
-                            best_cpu_ms=best_cpu_ms,
-                            reference_backend=best_cpu_backend,
-                            comparison_kind="CrossLibrarySameIntendedParameters",
-                            metrics=kornia_cpu_metrics,
-                            notes=(
-                                "Tensor conversion excluded; "
-                                "PyTorch CPU threads fixed to 1."
-                            ),
-                        ),
-                    )
-
-                    # keep two explicit skipped rows when CUDA is unavailable
+                    # CUDA executes the same Kornia operators once per repetition.
+                    # The two CSV rows below are two timing scopes of this one GPU
+                    # pipeline, not two different augmentation implementations.
                     if not cuda_available or cuda_device is None:
                         for backend, scope in (
                             (
@@ -680,27 +781,25 @@ def run_benchmark(
                                     library="Kornia/PyTorch",
                                     device="CUDA",
                                     workers=None,
-                                    parameter="VectorizedBatch",
+                                    parameter="SameKorniaPipeline",
                                     timer_scope=scope,
                                     warmups=plan.warmups,
                                     repetitions=plan.repetitions,
                                     statistics_data=None,
                                     sequential_ms=sequential_ms,
                                     best_cpu_ms=best_cpu_ms,
+                                    parallel_baseline_ms=None,
                                     reference_backend=best_cpu_backend,
-                                    comparison_kind="SameWorkloadDifferentBackend",
+                                    comparison_kind="SameWorkloadDifferentDevice",
                                     metrics=None,
                                     status="SKIPPED_NO_CUDA",
-                                    notes=(
-                                        "torch.cuda.is_available() returned False."
-                                    ),
+                                    notes="torch.cuda.is_available() returned False.",
                                 ),
                             )
                         print("  Kornia CUDA skipped: no CUDA device detected.")
                         continue
 
                     try:
-                        # clear cached blocks and reset peak-memory tracking
                         torch.cuda.empty_cache()
                         torch.cuda.reset_peak_memory_stats(cuda_device)
                         gpu_parameters = prepare_kornia_parameters(
@@ -711,7 +810,8 @@ def run_benchmark(
                             cuda_device,
                         )
 
-                        # end-to-end timing includes both transfers and augmentation
+                        # End-to-end scope: copy the existing CPU tensor to CUDA,
+                        # run Kornia on CUDA, then copy the result back to the CPU.
                         def run_cuda_end_to_end() -> torch.Tensor:
                             gpu_input = cpu_tensor.to(cuda_device)
                             gpu_output = apply_kornia(gpu_input, gpu_parameters)
@@ -743,7 +843,7 @@ def run_benchmark(
                                 library="Kornia/PyTorch",
                                 device="CUDA",
                                 workers=None,
-                                parameter="VectorizedBatch",
+                                parameter="SameKorniaPipeline",
                                 timer_scope=(
                                     "HostToDevice+Augmentation+DeviceToHost"
                                 ),
@@ -752,20 +852,20 @@ def run_benchmark(
                                 statistics_data=cuda_e2e_stats,
                                 sequential_ms=sequential_ms,
                                 best_cpu_ms=best_cpu_ms,
+                                parallel_baseline_ms=None,
                                 reference_backend=best_cpu_backend,
-                                comparison_kind=(
-                                    "CrossLibrarySameIntendedParameters"
-                                ),
+                                comparison_kind="CompletePathVsBestCPU",
                                 metrics=cuda_e2e_metrics,
                                 peak_memory_mb=peak_e2e_memory,
                                 notes=(
-                                    "Complete CUDA path directly compared "
-                                    "with the fastest valid CPU result."
+                                    "The augmentation runs on CUDA; only the "
+                                    "input and output tensor copies add transfer time."
                                 ),
                             ),
                         )
 
-                        # device-only timing reuses an input already stored on the GPU
+                        # Device-only scope: reuse the same input already on CUDA.
+                        # Only the Kornia CUDA operators are inside the timed region.
                         gpu_input = cpu_tensor.to(cuda_device)
                         torch.cuda.synchronize()
                         torch.cuda.reset_peak_memory_stats(cuda_device)
@@ -784,7 +884,7 @@ def run_benchmark(
                             cuda_device_stats.output
                         )
                         cuda_device_metrics = compare_batches(
-                            kornia_cpu_output,
+                            kornia_reference_output,
                             cuda_device_output,
                         )
                         peak_device_memory = (
@@ -800,34 +900,33 @@ def run_benchmark(
                                 library="Kornia/PyTorch",
                                 device="CUDA",
                                 workers=None,
-                                parameter="VectorizedBatch",
+                                parameter="SameKorniaPipeline",
                                 timer_scope="DeviceAugmentationOnly",
                                 warmups=plan.warmups,
                                 repetitions=plan.repetitions,
                                 statistics_data=cuda_device_stats,
                                 sequential_ms=sequential_ms,
                                 best_cpu_ms=best_cpu_ms,
-                                reference_backend="Kornia_CPU_Batch",
-                                comparison_kind="SameLibraryDifferentDevice",
+                                parallel_baseline_ms=None,
+                                reference_backend="Kornia_CPU_Batch_1Thread",
+                                comparison_kind="SameLibrarySamePipelineDifferentDevice",
                                 metrics=cuda_device_metrics,
                                 peak_memory_mb=peak_device_memory,
                                 notes=(
-                                    "Input already resident on the GPU; "
-                                    "transfer costs excluded."
+                                    "Input and parameters are already on CUDA; "
+                                    "host-device transfers are outside timing."
                                 ),
                             ),
                         )
                         print(
-                            f"  Kornia CUDA E2E: "
-                            f"{cuda_e2e_stats.mean_ms:.3f} ms, "
-                            f"best-CPU/GPU={best_cpu_ms / cuda_e2e_stats.mean_ms:.2f}x"
+                            f"  Kornia CUDA same pipeline, E2E scope: "
+                            f"{cuda_e2e_stats.mean_ms:.3f} ms"
                         )
                         print(
-                            f"  Kornia CUDA device-only: "
+                            f"  Kornia CUDA same pipeline, device-only scope: "
                             f"{cuda_device_stats.mean_ms:.3f} ms"
                         )
                     except RuntimeError as error:
-                        # only CUDA out-of-memory errors are converted to skipped rows
                         if "out of memory" not in str(error).lower():
                             raise
                         torch.cuda.empty_cache()
@@ -850,15 +949,16 @@ def run_benchmark(
                                     library="Kornia/PyTorch",
                                     device="CUDA",
                                     workers=None,
-                                    parameter="VectorizedBatch",
+                                    parameter="SameKorniaPipeline",
                                     timer_scope=scope,
                                     warmups=plan.warmups,
                                     repetitions=plan.repetitions,
                                     statistics_data=None,
                                     sequential_ms=sequential_ms,
                                     best_cpu_ms=best_cpu_ms,
+                                    parallel_baseline_ms=None,
                                     reference_backend=best_cpu_backend,
-                                    comparison_kind="SameWorkloadDifferentBackend",
+                                    comparison_kind="SameWorkloadDifferentDevice",
                                     metrics=None,
                                     status="SKIPPED_CUDA_OOM",
                                     notes=str(error).replace("\n", " "),
@@ -868,3 +968,4 @@ def run_benchmark(
 
     print(f"\nBenchmark completed. CSV saved to:\n{result_path}")
     return result_path
+
