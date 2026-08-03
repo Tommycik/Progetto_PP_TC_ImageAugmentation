@@ -128,6 +128,59 @@ def measure_torch_cpu(function: Callable[[], Any], threads: int, warmups: int, r
     )
 
 
+
+def measure_paired_scopes(
+    function: Callable[[], tuple[Any, float]],
+    warmups: int,
+    repetitions: int,
+) -> tuple[TimingStatistics, TimingStatistics]:
+    # one function execution returns the output and its nested device time
+    if repetitions < 1:
+        raise ValueError("At least one measured repetition is required.")
+
+    output: Any = None
+    for _ in range(warmups):
+        output, _ = function()
+
+    end_to_end_samples: list[float] = []
+    device_samples: list[float] = []
+
+    for _ in range(repetitions):
+        start = time.perf_counter_ns()
+        output, device_ms = function()
+        end_to_end_samples.append(
+            (time.perf_counter_ns() - start) / 1_000_000.0
+        )
+        device_samples.append(device_ms)
+
+    def build_statistics(samples: list[float]) -> TimingStatistics:
+        mean_ms = statistics.fmean(samples)
+        stddev_ms = (
+            statistics.pstdev(samples)
+            if len(samples) > 1
+            else 0.0
+        )
+        coefficient = (
+            stddev_ms / mean_ms * 100.0
+            if mean_ms > 0.0
+            else 0.0
+        )
+        return TimingStatistics(
+            output=output,
+            samples_ms=tuple(samples),
+            mean_ms=mean_ms,
+            median_ms=statistics.median(samples),
+            min_ms=min(samples),
+            max_ms=max(samples),
+            stddev_ms=stddev_ms,
+            coefficient_variation_percent=coefficient,
+        )
+
+    return (
+        build_statistics(end_to_end_samples),
+        build_statistics(device_samples),
+    )
+
 def _global_ssim(reference: np.ndarray, candidate: np.ndarray) -> float:
     # calculate one global SSIM score for every RGB channel
     ref = reference.astype(np.float64) / 255.0

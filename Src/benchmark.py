@@ -25,6 +25,7 @@ from .metrics import (
     TimingStatistics,
     compare_batches,
     measure,
+    measure_paired_scopes,
     measure_torch_cpu,
 )
 from .report import (
@@ -36,7 +37,10 @@ from .report import (
 )
 
 
+# -----------------------------------------------------------------------------
 # complete benchmark execution
+# -----------------------------------------------------------------------------
+
 def run_benchmark(
     source_images: list[np.ndarray],
     input_source: str,
@@ -320,7 +324,7 @@ def run_benchmark(
                                     library="Kornia/PyTorch",
                                     device="CUDA",
                                     workers=None,
-                                    parameter="SameKorniaPipeline",
+                                    parameter="SameExecutionPairedTimers",
                                     timer_scope=scope,
                                     warmups=plan.warmups,
                                     repetitions=plan.repetitions,
@@ -349,30 +353,55 @@ def run_benchmark(
                             cuda_device,
                         )
 
-                        # End-to-end scope: copy the existing CPU tensor to CUDA,
-                        # run Kornia on CUDA, then copy the result back to the CPU.
-                        def run_cuda_end_to_end() -> torch.Tensor:
-                            gpu_input = cpu_tensor.to(cuda_device)
-                            gpu_output = apply_kornia(gpu_input, gpu_parameters)
-                            return gpu_output.to(cpu_device)
+                        # One execution produces both timing scopes.
+                        # The host timer covers transfers and augmentation.
+                        # CUDA events delimit only the augmentation kernels.
+                        def run_cuda_paired() -> tuple[torch.Tensor, float]:
+                            start_event = torch.cuda.Event(
+                                enable_timing=True
+                            )
+                            end_event = torch.cuda.Event(
+                                enable_timing=True
+                            )
 
-                        cuda_e2e_stats = measure(
-                            run_cuda_end_to_end,
-                            warmups=plan.warmups,
-                            repetitions=plan.repetitions,
-                            synchronize=torch.cuda.synchronize,
+                            gpu_input = cpu_tensor.to(cuda_device)
+                            start_event.record()
+                            gpu_output = apply_kornia(
+                                gpu_input,
+                                gpu_parameters,
+                            )
+                            end_event.record()
+                            cpu_output = gpu_output.to(cpu_device)
+
+                            torch.cuda.synchronize()
+                            device_ms = start_event.elapsed_time(end_event)
+                            return cpu_output, device_ms
+
+                        cuda_e2e_stats, cuda_device_stats = (
+                            measure_paired_scopes(
+                                run_cuda_paired,
+                                warmups=plan.warmups,
+                                repetitions=plan.repetitions,
+                            )
                         )
-                        cuda_e2e_output = tensor_to_numpy_batch(
+
+                        cuda_output = tensor_to_numpy_batch(
                             cuda_e2e_stats.output
                         )
                         cuda_e2e_metrics = compare_batches(
                             best_cpu_output,
-                            cuda_e2e_output,
+                            cuda_output,
                         )
-                        peak_e2e_memory = (
+                        cuda_device_metrics = compare_batches(
+                            kornia_reference_output,
+                            cuda_output,
+                        )
+
+                        peak_cuda_memory = (
                             torch.cuda.max_memory_allocated(cuda_device)
                             / (1024.0**2)
                         )
+
                         _write_row(
                             writer,
                             file_handle,
@@ -382,7 +411,7 @@ def run_benchmark(
                                 library="Kornia/PyTorch",
                                 device="CUDA",
                                 workers=None,
-                                parameter="SameKorniaPipeline",
+                                parameter="SameExecutionPairedTimers",
                                 timer_scope=(
                                     "HostToDevice+Augmentation+DeviceToHost"
                                 ),
@@ -395,41 +424,14 @@ def run_benchmark(
                                 reference_backend=best_cpu_backend,
                                 comparison_kind="CompletePathVsBestCPU",
                                 metrics=cuda_e2e_metrics,
-                                peak_memory_mb=peak_e2e_memory,
+                                peak_memory_mb=peak_cuda_memory,
                                 notes=(
-                                    "The augmentation runs on CUDA; only the "
-                                    "input and output tensor copies add transfer time."
+                                    "Host timer and CUDA events measure the "
+                                    "same pipeline executions."
                                 ),
                             ),
                         )
 
-                        # Device-only scope: reuse the same input already on CUDA.
-                        # Only the Kornia CUDA operators are inside the timed region.
-                        gpu_input = cpu_tensor.to(cuda_device)
-                        torch.cuda.synchronize()
-                        torch.cuda.reset_peak_memory_stats(cuda_device)
-                        cuda_device_operation = partial(
-                            apply_kornia,
-                            gpu_input,
-                            gpu_parameters,
-                        )
-                        cuda_device_stats = measure(
-                            cuda_device_operation,
-                            warmups=plan.warmups,
-                            repetitions=plan.repetitions,
-                            synchronize=torch.cuda.synchronize,
-                        )
-                        cuda_device_output = tensor_to_numpy_batch(
-                            cuda_device_stats.output
-                        )
-                        cuda_device_metrics = compare_batches(
-                            kornia_reference_output,
-                            cuda_device_output,
-                        )
-                        peak_device_memory = (
-                            torch.cuda.max_memory_allocated(cuda_device)
-                            / (1024.0**2)
-                        )
                         _write_row(
                             writer,
                             file_handle,
@@ -439,7 +441,7 @@ def run_benchmark(
                                 library="Kornia/PyTorch",
                                 device="CUDA",
                                 workers=None,
-                                parameter="SameKorniaPipeline",
+                                parameter="SameExecutionPairedTimers",
                                 timer_scope="DeviceAugmentationOnly",
                                 warmups=plan.warmups,
                                 repetitions=plan.repetitions,
@@ -448,21 +450,24 @@ def run_benchmark(
                                 best_cpu_ms=best_cpu_ms,
                                 parallel_baseline_ms=None,
                                 reference_backend="Kornia_CPU_Batch_1Thread",
-                                comparison_kind="SameLibrarySamePipelineDifferentDevice",
+                                comparison_kind=(
+                                    "SameLibrarySamePipelineDifferentDevice"
+                                ),
                                 metrics=cuda_device_metrics,
-                                peak_memory_mb=peak_device_memory,
+                                peak_memory_mb=peak_cuda_memory,
                                 notes=(
-                                    "Input and parameters are already on CUDA; "
-                                    "host-device transfers are outside timing."
+                                    "CUDA events delimit augmentation inside "
+                                    "the same end-to-end executions."
                                 ),
                             ),
                         )
+
                         print(
-                            f"  Kornia CUDA same pipeline, E2E scope: "
+                            f"  Kornia CUDA paired timing, E2E scope: "
                             f"{cuda_e2e_stats.mean_ms:.3f} ms"
                         )
                         print(
-                            f"  Kornia CUDA same pipeline, device-only scope: "
+                            f"  Kornia CUDA paired timing, device-only scope: "
                             f"{cuda_device_stats.mean_ms:.3f} ms"
                         )
                     except RuntimeError as error:
@@ -488,7 +493,7 @@ def run_benchmark(
                                     library="Kornia/PyTorch",
                                     device="CUDA",
                                     workers=None,
-                                    parameter="SameKorniaPipeline",
+                                    parameter="SameExecutionPairedTimers",
                                     timer_scope=scope,
                                     warmups=plan.warmups,
                                     repetitions=plan.repetitions,
