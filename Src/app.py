@@ -43,9 +43,7 @@ SUPPORTED_EXTENSIONS = {
 }
 
 
-# -----------------------------------------------------------------------------
 # runtime configuration
-# -----------------------------------------------------------------------------
 
 def _configure_runtime() -> None:
     # one OpenCV thread prevents nested parallelism inside each worker
@@ -61,11 +59,7 @@ def _configure_runtime() -> None:
         # PyTorch may reject the change after its thread system is initialized.
         pass
 
-
-# -----------------------------------------------------------------------------
 # image loading and batch construction
-# -----------------------------------------------------------------------------
-
 def _synthetic_image(width: int = 1024, height: int = 1024) -> np.ndarray:
     # coordinate matrices used to build the three colour channels
     y, x = np.mgrid[0:height, 0:width]
@@ -136,11 +130,7 @@ def _read_source_images() -> tuple[list[np.ndarray], str]:
     return images, source
 
 
-def _build_batch(
-    images: list[np.ndarray],
-    size: int,
-    batch_size: int,
-) -> list[np.ndarray]:
+def _build_batch(images: list[np.ndarray], size: int, batch_size: int,) -> list[np.ndarray]:
     # resize every source once before constructing the repeated batch
     if not images:
         raise ValueError("At least one source image is required.")
@@ -202,25 +192,20 @@ def _make_contact_sheet(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(output_path)
 
-
-# -----------------------------------------------------------------------------
 # preview generation
-# -----------------------------------------------------------------------------
-
 def _generate_preview(source_images: list[np.ndarray]) -> Path:
-    # Use one fixed and predictable preview configuration.
+    # one fixed and predictable preview configuration.
     profile_name = "MixedStrong"
     resolution = 512
     batch_size = 8
     worker_count = 8
 
-    # Build the same deterministic batch used by the preview.
+    # Build the deterministic batch
     profile = PROFILES[profile_name]
     images = _build_batch(source_images, resolution, batch_size)
     prepared = prepare_albumentations(profile, batch_size)
 
     # Apply Albumentations with exactly eight CPU workers.
-    # No benchmark or backend search is performed in preview mode.
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         preview_images = run_albumentations_threaded(
             images,
@@ -268,10 +253,7 @@ def _generate_preview(source_images: list[np.ndarray]) -> Path:
     return output_directory
 
 
-# -----------------------------------------------------------------------------
 # environment report and interactive menu
-# -----------------------------------------------------------------------------
-
 def _environment_report() -> None:
     # print software, CPU and GPU information used by the benchmark
     print("\nENVIRONMENT")
@@ -301,7 +283,7 @@ def run_application() -> None:
     ensure_output_directories()
     _configure_runtime()
 
-    print("IMAGE AUGMENTATION BENCHMARK")
+    print("Image augmentation benchmark")
     print("Albumentations CPU versus Kornia CPU/CUDA")
     print(f"CSV output: {RESULTS_ROOT}")
     print(f"Preview output: {PREVIEWS_ROOT}")

@@ -88,13 +88,14 @@ The sign and magnitude of the transformation change with the sample index using 
 The workload matrix contains:
 
 - `512x512` with batches `1, 4, 8, 16, 32, 64`;
-- `1024x1024` with batches `1, 4, 8, 16, 32`;
-- `2048x2048` with batches `1, 4, 8`;
+- `1024x1024` with batches `1, 4, 8, 16, 32, 64`;
+- `2048x2048` with batches `1, 4, 8, 16`;
+- `4096x4096` with batches `1, 4, 8, 16`;
 - CPU thread counts `1, 2, 4, 6, 8, 12`;
 - two warm-up executions;
 - five measured repetitions.
 
-Seven profiles and fourteen resolution-batch combinations produce 98 workloads. Every workload writes:
+Seven profiles and twenty resolution-batch combinations produce 140 workloads. Every workload writes:
 
 ```text
 1 Albumentations sequential row
@@ -106,7 +107,7 @@ Seven profiles and fourteen resolution-batch combinations produce 98 workloads. 
 The complete benchmark therefore produces:
 
 ```text
-98 x 15 = 1470 rows
+140 x 15 = 2100 rows
 ```
 
 The fastest valid CPU configuration is selected across Albumentations and Kornia for each workload.
@@ -199,6 +200,8 @@ Src/
 ├── app.py
 ├── config.py
 ├── backends.py
+├── metrics.py
+├── report.py
 └── benchmark.py
 requirements.txt
 Output/
@@ -209,8 +212,10 @@ Output/
 - `main.py` starts the application.
 - `Src/app.py` contains the menu, image loading, batch creation, fixed preview and environment report.
 - `Src/config.py` contains paths, profiles, deterministic parameters and the benchmark plan.
-- `Src/backends.py` contains the Albumentations and Kornia operations.
-- `Src/benchmark.py` contains timing, CPU thread scaling, CUDA timing scopes, metrics and CSV generation.
+- `Src/backends.py` contains the unchanged Albumentations and Kornia operations.
+- `Src/metrics.py` contains the original timing and output-comparison functions moved from `benchmark.py`.
+- `Src/report.py` contains the original CSV schema and row helper functions moved from `benchmark.py`.
+- `Src/benchmark.py` retains workload iteration, backend orchestration, CSV opening and row-writing calls.
 - `Src/__init__.py` marks `Src` as a Python package.
 
 ## Use from PyCharm

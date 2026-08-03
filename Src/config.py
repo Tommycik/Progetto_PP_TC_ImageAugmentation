@@ -5,29 +5,19 @@ from pathlib import Path
 from typing import Final
 
 
-# -----------------------------------------------------------------------------
-# project paths
-# -----------------------------------------------------------------------------
-
 # directories used by the menu, benchmark and preview generator
 PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
 OUTPUT_ROOT: Final[Path] = PROJECT_ROOT / "Output"
 RESULTS_ROOT: Final[Path] = OUTPUT_ROOT / "Results"
 PREVIEWS_ROOT: Final[Path] = OUTPUT_ROOT / "Previews"
 
-# -----------------------------------------------------------------------------
-# correctness thresholds
-# -----------------------------------------------------------------------------
 
 # limits used for cross-library output verification
 DEFAULT_TOLERANCE: Final[int] = 3
 DEFAULT_MAE_LIMIT: Final[float] = 2.0
 DEFAULT_SSIM_LIMIT: Final[float] = 0.990
 
-
-# -----------------------------------------------------------------------------
 # configuration containers
-# -----------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class AugmentationProfile:
@@ -70,11 +60,7 @@ class BenchmarkPlan:
     repetitions: int
     warmups: int
 
-
-# -----------------------------------------------------------------------------
 # augmentation profiles
-# -----------------------------------------------------------------------------
-
 # each profile uses operations implemented by Albumentations and Kornia
 PROFILES: Final[dict[str, AugmentationProfile]] = {
     "Identity": AugmentationProfile(
@@ -137,10 +123,7 @@ PROFILES: Final[dict[str, AugmentationProfile]] = {
     ),
 }
 
-
-# -----------------------------------------------------------------------------
 # benchmark plan
-# -----------------------------------------------------------------------------
 
 # one complete run evaluates every profile, resolution, batch and CPU thread count
 FULL_BENCHMARK_PLAN: Final[BenchmarkPlan] = BenchmarkPlan(
@@ -148,8 +131,9 @@ FULL_BENCHMARK_PLAN: Final[BenchmarkPlan] = BenchmarkPlan(
     profiles=tuple(PROFILES.keys()),
     workloads=(
         (512, (1, 4, 8, 16, 32, 64)),
-        (1024, (1, 4, 8, 16, 32)),
-        (2048, (1, 4, 8)),
+        (1024, (1, 4, 8, 16, 32, 64)),
+        (2048, (1, 4, 8, 16)),
+        (4096, (1, 4, 8, 16)),
     ),
     # used by Albumentations workers and Kornia/PyTorch intra-op threads
     thread_counts=(1, 2, 4, 6, 8, 12),
@@ -158,10 +142,9 @@ FULL_BENCHMARK_PLAN: Final[BenchmarkPlan] = BenchmarkPlan(
 )
 
 
-# -----------------------------------------------------------------------------
 # deterministic parameters
-# -----------------------------------------------------------------------------
 
+# create a reproducible set of parameters for each sample in a profile
 def parameters_for_sample(
     profile: AugmentationProfile,
     sample_index: int,

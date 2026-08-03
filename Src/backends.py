@@ -13,10 +13,7 @@ import torch
 from .config import AugmentationProfile, SampleParameters, parameters_for_sample
 
 
-# -----------------------------------------------------------------------------
 # backend parameter containers
-# -----------------------------------------------------------------------------
-
 @dataclass(frozen=True)
 class PreparedAlbumentations:
     # one prepared transformation for every image in the batch
@@ -168,10 +165,7 @@ def run_albumentations_threaded(
     )
 
 
-# -----------------------------------------------------------------------------
 # NumPy and tensor conversion
-# -----------------------------------------------------------------------------
-
 def numpy_batch_to_tensor(images: list[np.ndarray]) -> torch.Tensor:
     # stack RGB uint8 images and convert NHWC to BCHW float32
     batch = np.stack(images, axis=0)
@@ -199,10 +193,8 @@ def tensor_to_numpy_batch(tensor: torch.Tensor) -> list[np.ndarray]:
     return [item.copy() for item in array]
 
 
-# -----------------------------------------------------------------------------
-# Kornia CPU and CUDA path
-# -----------------------------------------------------------------------------
 
+# Kornia CPU and CUDA path
 def prepare_kornia_parameters(
     profile: AugmentationProfile,
     batch_size: int,
@@ -245,10 +237,7 @@ def prepare_kornia_parameters(
     )
 
 
-def apply_kornia(
-    batch: torch.Tensor,
-    parameters: KorniaParameters,
-) -> torch.Tensor:
+def apply_kornia(batch: torch.Tensor, parameters: KorniaParameters,) -> torch.Tensor:
     # execute the same batch pipeline on the tensor device
     with torch.inference_mode():
         # every operation creates the next stage of the batch pipeline
