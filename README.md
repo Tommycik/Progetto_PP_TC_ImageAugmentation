@@ -88,14 +88,16 @@ The sign and magnitude of the transformation change with the sample index using 
 The workload matrix contains:
 
 - `512x512` with batches `1, 4, 8, 16, 32, 64`;
-- `1024x1024` with batches `1, 4, 8, 16, 32, 64`;
-- `2048x2048` with batches `1, 4, 8, 16`;
-- `4096x4096` with batches `1, 4, 8, 16`;
+- `1024x1024` with batches `1, 4, 8, 16, 32`;
+- `2048x2048` with batches `1, 4, 8`;
+- `4096x4096` with batches `1, 2`;
 - CPU thread counts `1, 2, 4, 6, 8, 12`;
 - two warm-up executions;
 - five measured repetitions.
 
-Seven profiles and twenty resolution-batch combinations produce 140 workloads. Every workload writes:
+The maximum batch at `4096x4096` is two because memory usage grows with both image area and the number of tensors retained by the Kornia pipeline. One RGB `float32` tensor at this resolution requires approximately 192 MiB per image, so batch two requires about 384 MiB for one tensor alone. Input, output, affine, blur and transfer tensors coexist during execution. MixedStrong at batch two reaches a measured CUDA peak of approximately 2312.9 MB. Larger batches would create unnecessary GPU and system-memory pressure and increase the risk of an out-of-memory failure.
+
+Seven profiles and sixteen resolution-batch combinations produce 112 workloads. Every workload writes:
 
 ```text
 1 Albumentations sequential row
@@ -107,7 +109,7 @@ Seven profiles and twenty resolution-batch combinations produce 140 workloads. E
 The complete benchmark therefore produces:
 
 ```text
-140 x 15 = 2100 rows
+112 x 15 = 1680 rows
 ```
 
 The fastest valid CPU configuration is selected across Albumentations and Kornia for each workload.

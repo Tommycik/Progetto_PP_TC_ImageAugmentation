@@ -131,9 +131,9 @@ FULL_BENCHMARK_PLAN: Final[BenchmarkPlan] = BenchmarkPlan(
     profiles=tuple(PROFILES.keys()),
     workloads=(
         (512, (1, 4, 8, 16, 32, 64)),
-        (1024, (1, 4, 8, 16, 32, 64)),
-        (2048, (1, 4, 8, 16)),
-        (4096, (1, 4, 8, 16)),
+        (1024, (1, 4, 8, 16, 32)),
+        (2048, (1, 4, 8)),
+        (4096, (1, 2)),
     ),
     # used by Albumentations workers and Kornia/PyTorch intra-op threads
     thread_counts=(1, 2, 4, 6, 8, 12),
