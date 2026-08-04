@@ -95,7 +95,7 @@ The workload matrix contains:
 - two warm-up executions;
 - five measured repetitions.
 
-The maximum batch at `4096x4096` is two because memory usage grows with both image area and the number of tensors retained by the Kornia pipeline. One RGB `float32` tensor at this resolution requires approximately 192 MiB per image, so batch two requires about 384 MiB for one tensor alone. Input, output, affine, blur and transfer tensors coexist during execution. MixedStrong at batch two reaches a measured CUDA peak of approximately 2312.9 MB. Larger batches would create unnecessary GPU and system-memory pressure and increase the risk of an out-of-memory failure.
+The maximum batch at `4096x4096` is two because memory usage grows with both image area and the number of tensors retained by the Kornia pipeline. One RGB `float32` tensor at this resolution requires approximately 192 MiB per image, so batch two requires about 384 MiB for one tensor alone. Input, output, affine, blur and transfer tensors coexist during execution. MixedStrong at batch two reaches a measured CUDA peak of approximately 2312.9 MB. Larger batches were excluded to reduce GPU and system-memory pressure and avoid out-of-memory failures.
 
 Seven profiles and sixteen resolution-batch combinations produce 112 workloads. Every workload writes:
 
