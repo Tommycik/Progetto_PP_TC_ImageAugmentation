@@ -35,9 +35,7 @@ class KorniaParameters:
     blur_sigma: float
 
 
-# -----------------------------------------------------------------------------
 # Albumentations CPU path
-# -----------------------------------------------------------------------------
 
 def _fixed_affine(parameters: SampleParameters) -> Callable[..., np.ndarray]:
     # create the fixed OpenCV affine callback for one image
