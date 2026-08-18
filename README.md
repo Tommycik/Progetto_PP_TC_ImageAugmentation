@@ -2,7 +2,7 @@
 
 ## Project overview
 
-This project benchmarks deterministic image augmentation on the CPU and GPU from a Python application executed directly in PyCharm. Albumentations provides an image-oriented CPU implementation. Kornia provides one batch-oriented PyTorch implementation that can execute on the CPU or CUDA.
+This project benchmarks deterministic image augmentations on the CPU and GPU from a Python application. Albumentations provides an image-oriented CPU implementation while Kornia provides one batch-oriented PyTorch implementation that can execute on the CPU or CUDA.
 
 Every implementation receives the same images, profiles and deterministic per-sample parameters. The benchmark records timing, scalability and output-comparison data in CSV format.
 
@@ -42,7 +42,7 @@ Thread-pool construction is outside the timed region. The output must be exactly
 
 Kornia uses one transformation function for all measurements. The function applies flips, affine transformation, brightness, contrast and Gaussian blur to a complete tensor batch.
 
-The project does not contain three different Kornia algorithms. It evaluates the same Kornia pipeline under different execution conditions.
+The project evaluates the same Kornia pipeline under different execution conditions.
 
 ### Kornia CPU
 
@@ -52,20 +52,18 @@ The same CPU tensor operation is measured with these PyTorch intra-operation thr
 1, 2, 4, 6, 8, 12
 ```
 
-PyTorch inter-operation parallelism remains fixed to one. `torch.utils.benchmark.Timer` applies the selected intra-operation thread-pool size during each measurement.
+PyTorch inter-operation parallelism remains fixed to one.
 
-Tensor conversion is outside the full benchmark timing. The one-thread Kornia result is the scaling baseline for the other Kornia CPU rows.
+Tensor conversion is outside the full benchmark timing. The one-thread Kornia result is the scaling baseline for the other Kornia CPU tests.
 
 ### Kornia CUDA
 
-The Kornia pipeline is executed on CUDA tensors. The augmentation runs on the GPU.
+The Kornia pipeline is executed on CUDA tensors and runs on the GPU.
 
 The same CUDA execution is recorded with two timing scopes:
 
 - **End-to-end scope** includes the CPU-to-GPU tensor copy, Kornia augmentation on the GPU and the GPU-to-CPU result copy.
 - **Device-only scope** measures only the Kornia augmentation after the input and parameter tensors are already on the GPU.
-
-These rows are two timings of one CUDA pipeline. They are not separate augmentation implementations.
 
 The device-only value is useful when the previous and following stages also operate on GPU tensors. The end-to-end value is the direct comparison for a program whose input and output remain in CPU memory.
 
@@ -97,19 +95,19 @@ The workload matrix contains:
 
 The maximum batch at `4096x4096` is two because memory usage grows with both image area and the number of tensors retained by the Kornia pipeline. One RGB `float32` tensor at this resolution requires approximately 192 MiB per image, so batch two requires about 384 MiB for one tensor alone. Input, output, affine, blur and transfer tensors coexist during execution. MixedStrong at batch two reaches a measured CUDA peak of approximately 2312.9 MB. Larger batches were excluded to reduce GPU and system-memory pressure and avoid out-of-memory failures.
 
-Seven profiles and sixteen resolution-batch combinations produce 112 workloads. Every workload writes:
+Seven profiles and sixteen resolution-batch combinations produce 112 workloads. Every workload executes:
 
 ```text
-1 Albumentations sequential row
-6 Albumentations ThreadPool rows
-6 Kornia CPU thread rows
-2 Kornia CUDA timing-scope rows
+1 Albumentations sequential test
+6 Albumentations ThreadPool tests
+6 Kornia CPU thread tests
+1 Kornia CUDA test
 ```
 
 The complete benchmark therefore produces:
 
 ```text
-112 x 15 = 1680 rows
+112 x 14 = 1568 tests
 ```
 
 The fastest valid CPU configuration is selected across Albumentations and Kornia for each workload.
@@ -148,7 +146,6 @@ The benchmark records:
 
 - exact equality;
 - tolerance equality;
-- different values and pixels;
 - mean absolute error;
 - root mean square error;
 - maximum difference;
@@ -159,7 +156,6 @@ MAE is the average absolute difference between corresponding 8-bit channel value
 
 SSIM measures structural similarity. A value of one indicates identical images. The project calculates one global value for every RGB channel and averages the three results.
 
-Albumentations ThreadPool is compared with Albumentations sequential. Kornia CPU and CUDA are compared using the same deterministic workload and tolerance thresholds.
 
 ## Preview generation
 
@@ -173,7 +169,7 @@ Resolution: 512x512
 Batch size: 8
 ```
 
-Preview mode does not benchmark or compare backends. It directly applies the prepared Albumentations transformations with eight workers, saves the input and output images, and creates a contact sheet.
+The preview mode applies the prepared Albumentations transformations with eight workers, saves the input and output images and creates a contact sheet.
 
 ## Input formats
 
@@ -215,8 +211,8 @@ Output/
 - `Src/app.py` contains the menu, image loading, batch creation, fixed preview and environment report.
 - `Src/config.py` contains paths, profiles, deterministic parameters and the benchmark plan.
 - `Src/backends.py` contains the unchanged Albumentations and Kornia operations.
-- `Src/metrics.py` contains the original timing and output-comparison functions moved from `benchmark.py`.
-- `Src/report.py` contains the original CSV schema and row helper functions moved from `benchmark.py`.
+- `Src/metrics.py` contains the timing and output-comparison functions.
+- `Src/report.py` contains the CSV schema and row helper functions.
 - `Src/benchmark.py` retains workload iteration, backend orchestration, CSV opening and row-writing calls.
 - `Src/__init__.py` marks `Src` as a Python package.
 
