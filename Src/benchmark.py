@@ -37,9 +37,7 @@ from .report import (
 )
 
 
-# -----------------------------------------------------------------------------
 # complete benchmark execution
-# -----------------------------------------------------------------------------
 
 def run_benchmark(
     source_images: list[np.ndarray],
