@@ -114,86 +114,81 @@ The fastest valid CPU configuration is selected across Albumentations and Kornia
 
 ## Timing metrics
 
-The CSV records mean, median, minimum, maximum, population standard deviation and coefficient of variation.
+The CSV stores the execution time of every configuration using several simple statistics:
 
-- **TimeMean_ms** is the arithmetic mean of the measured repetitions and is the main execution-time value used for performance comparisons.
-- **TimeMedian_ms** is the middle measured time after sorting the repetitions. It is less sensitive than the mean to isolated slow or fast samples.
-- **TimeMin_ms** and **TimeMax_ms** are the fastest and slowest measured repetitions and show the observed timing range.
-- **StdDev_ms** is the population standard deviation in milliseconds and measures the absolute dispersion of repeated measurements.
-- **CoefficientVariation_percent** expresses timing variation relative to the mean:
+- **TimeMean_ms** is the average execution time and is the main value used to compare performance.
+- **TimeMedian_ms** is the middle measured time and is useful when one repetition is unusually slow or fast.
+- **TimeMin_ms** and **TimeMax_ms** are the fastest and slowest repetitions.
+- **StdDev_ms** shows how much the measured times vary around the mean.
+- **CoefficientVariation_percent** expresses the same variability as a percentage of the mean:
 
 ```text
 CV = standard deviation / mean x 100
 ```
 
-A lower CV indicates more stable repeated measurements and makes timing variability comparable across workloads with very different execution times.
+A low CV means that repeated measurements are stable.
 
-The CSV also stores the baselines and speedups used for the different comparisons:
+The CSV also stores the reference times used to calculate speedups:
 
 - **SequentialBaseline_ms** is the Albumentations sequential time for the same workload.
-- **BestCpu_ms** is the fastest valid CPU time selected across Albumentations sequential, Albumentations ThreadPool and Kornia CPU.
-- **Speedup_vs_Sequential** is the sequential baseline divided by the measured time.
-- **Speedup_vs_BestCPU** is the fastest valid CPU time divided by the measured time and is the direct comparison used for CUDA.
-- **ParallelBaseline_ms** is the baseline used for internal CPU scaling. Albumentations uses its sequential result while Kornia CPU uses its one-thread tensor result.
-- **ParallelSpeedup** is:
-
-```text
-parallel speedup = parallel baseline / parallel time
-```
-
-- **ParallelEfficiency** is:
+- **BestCpu_ms** is the fastest valid CPU time for that workload.
+- **Speedup_vs_Sequential** shows how many times faster a configuration is than the sequential baseline.
+- **Speedup_vs_BestCPU** compares a configuration with the fastest CPU result. This is the main speedup used for CUDA comparisons.
+- **ParallelBaseline_ms** is the reference used to study CPU scaling. Albumentations uses its sequential execution, while Kornia CPU uses its one-thread execution.
+- **ParallelSpeedup** shows how much faster the parallel execution is than its own baseline.
+- **ParallelEfficiency** relates that speedup to the number of workers or threads:
 
 ```text
 parallel efficiency = parallel speedup / number of workers or threads
 ```
 
-Parallel efficiency is used only when an explicit CPU worker or thread count exists. It is not used as a CUDA efficiency measure.
+An efficiency close to one means that the added CPU workers are being used very effectively. This metric is only used for CPU configurations, not for CUDA.
 
-The CSV records two throughput metrics:
+Two throughput values are also saved:
 
-- **Throughput_images_s** is the number of complete images processed per second. It shows how effectively batching amortizes scheduling, framework and launch overhead.
-- **Throughput_MPixels_s** is the number of millions of image pixels processed per second. It also includes image resolution and is useful when comparing workloads with different image sizes.
+- **Throughput_images_s** is the number of complete images processed each second.
+- **Throughput_MPixels_s** is the number of millions of pixels processed each second.
 
-They are calculated as:
+These values are useful for understanding how much work a configuration can process, especially when batch size or image resolution changes.
 
 ```text
 Throughput_images_s = BatchSize x 1000 / TimeMean_ms
 Throughput_MPixels_s = BatchSize x Width x Height / TimeMean_ms / 1000
 ```
 
-**CudaPeakMemory_MB** is the peak CUDA memory allocated during the GPU execution. It is useful for relating batch limits to image resolution and to the memory required by input, output and intermediate tensors.
+**CudaPeakMemory_MB** is the maximum CUDA memory used during the GPU execution. It helps explain why larger images require smaller maximum batch sizes.
 
 ## Output verification
 
-The benchmark records:
+Performance is useful only if the different implementations still produce equivalent outputs. For this reason, the CSV stores several comparison metrics:
 
-- **ExactMatch**, which is true only when every corresponding RGB channel value is identical;
-- **ToleranceMatch**, which indicates whether the output satisfies the configured numerical acceptance rule even when it is not exactly identical;
-- **DifferentValues**, which counts individual RGB channel values that differ;
-- **DifferentPixels**, which counts pixels for which at least one RGB channel differs;
-- **MAE**, the mean absolute error between corresponding 8-bit channel values. Zero means identical values and lower values indicate a smaller average difference;
-- **RMSE**, the root mean square error. Larger isolated errors have more influence than in MAE because the differences are squared before averaging;
-- **MaxDifference**, the largest absolute difference found in any corresponding channel value. It helps detect a local large error that could be hidden by a small average error;
-- **PSNR_dB**, the peak signal-to-noise ratio derived from RMSE on the 0-255 image scale. Higher values indicate closer images and an exact match produces infinite PSNR;
-- **GlobalSSIM**, which measures global structural similarity. A value of one indicates identical structure. The project calculates one value for each complete RGB channel and averages the three results.
+- **ExactMatch** checks whether every output value is exactly equal to the reference.
+- **ToleranceMatch** checks whether small numerical differences are still inside the accepted limits.
+- **DifferentValues** counts how many individual RGB values are different.
+- **DifferentPixels** counts how many pixels contain at least one different channel.
+- **MAE** measures the average absolute difference between corresponding values. Lower is better and zero means an exact match.
+- **RMSE** is similar to MAE but gives more importance to larger differences.
+- **MaxDifference** is the largest single difference found between the two outputs.
+- **PSNR_dB** is another image-error measure derived from RMSE. Higher values mean that the two images are more similar.
+- **GlobalSSIM** measures overall structural similarity. Values close to one indicate very similar images.
 
-Tolerance matching is useful because Albumentations, Kornia CPU and Kornia CUDA can use different interpolation, floating-point arithmetic and rounding while still applying the same intended transformation.
+These metrics are useful because Albumentations and Kornia can produce slightly different numerical values even when they apply the same intended augmentation.
 
 ### Metrics used in the final report and presentation
 
-The CSV intentionally contains more metrics than the final report and presentation. The final documents use the mean execution time, minimum and maximum values where relevant, standard deviation and CV, internal CPU speedup and parallel efficiency, CUDA speedup against the fastest valid CPU result, CUDA peak memory, exact or tolerance verification, MAE and global SSIM. The report discusses throughput mainly through time per image instead of presenting the raw throughput columns directly.
+The CSV contains more information than was needed in the final report and presentation.
 
-`TimeMedian_ms`, `DifferentValues`, `DifferentPixels`, `RMSE`, `PSNR_dB`, `Throughput_images_s` and `Throughput_MPixels_s` are retained mainly for diagnostics, reproducibility and deeper analysis but are not presented directly as result metrics in the final report or presentation. `MaxDifference` is also not presented directly, although it contributes to the tolerance rule used to validate outputs.
+The final documents mainly use mean execution time, standard deviation, CV, speedup, CPU parallel efficiency, CUDA peak memory, exact or tolerance matching, MAE and global SSIM. Minimum and maximum times are also used when discussing measurement stability.
+
+`TimeMedian_ms`, `DifferentValues`, `DifferentPixels`, `RMSE`, `PSNR_dB`, `Throughput_images_s` and `Throughput_MPixels_s` are stored mainly for additional inspection and are not presented directly as result metrics in the final report or presentation. `MaxDifference` is also not shown directly, but it is used by the tolerance check.
 
 ## Results interpretation
 
-Albumentations is the fastest CPU library in all 112 workloads. Its ThreadPool implementation is the fastest CPU configuration in 87 workloads while the sequential path remains best in 25 smaller or lighter cases. The maximum internal CPU speedup is `5.47x` for Albumentations and `3.03x` for Kornia CPU. The two libraries scale differently because Albumentations distributes independent images among workers while Kornia uses PyTorch intra-operation parallelism inside tensor operations.
+The results show that Albumentations is the strongest CPU option for this benchmark, its ThreadPool version benefits from processing independent images in parallel. Kornia CPU also gains from additional threads but its scaling is more limited.
 
-Kornia CUDA device-only is faster than the best CPU result in 61 of the 112 workloads and reaches a maximum speedup of `10.76x`. Complete CUDA end-to-end execution is faster in 12 workloads and reaches `2.93x`. Small images and light profiles are dominated by framework, kernel-launch and transfer overhead, while larger resolutions and more expensive geometric or mixed profiles provide enough work to make GPU execution advantageous.
+CUDA becomes useful only when the workload is large enough. The device-only timing shows the potential performance when the data is already on the GPU while the end-to-end timing is more representative when images start and end in the CPU memory because it also includes data transfers.
 
-Device-only and end-to-end timings describe different use cases. Device-only isolates the augmentation kernels after the tensors are already on the GPU, while end-to-end also includes host-to-device transfer, device-to-host transfer and final synchronization. In the largest MixedStrong workloads the device interval represents only about 38 percent of the end-to-end time, showing that transfers and host-side overhead remain significant when the augmentation is used as an isolated stage connected to CPU memory.
-
-All 1680 result rows satisfy the configured tolerance. Albumentations ThreadPool is exactly equal to its sequential reference in every workload. Kornia CPU and CUDA end-to-end have a mean MAE close to `0.42` against the Albumentations reference and their minimum global SSIM remains above `0.996`. CUDA device-only compared with Kornia CPU one-thread has a mean MAE of `0.000106` and a minimum SSIM of `0.999999`. The larger output differences therefore come mainly from the different Albumentations and Kornia implementations rather than from moving the same Kornia pipeline from CPU to CUDA.
+The output comparisons show that all configurations remain within the accepted tolerance. Albumentations ThreadPool matches its sequential reference exactly while Kornia CPU and CUDA show only small numerical differences. Most of the larger differences come from comparing the Albumentations and Kornia implementations rather than from changing Kornia from CPU to CUDA.
 
 
 ## Preview generation
