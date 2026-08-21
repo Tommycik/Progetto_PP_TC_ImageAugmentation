@@ -118,10 +118,7 @@ def _build_albumentations_transform(parameters: SampleParameters) -> alb.Compose
     return alb.Compose(transforms, strict=True)
 
 
-def prepare_albumentations(
-    profile: AugmentationProfile,
-    batch_size: int,
-) -> PreparedAlbumentations:
+def prepare_albumentations(profile: AugmentationProfile, batch_size: int,) -> PreparedAlbumentations:
     # prepare the complete batch before the timed repetitions
     return PreparedAlbumentations(
         transforms=tuple(
@@ -133,10 +130,7 @@ def prepare_albumentations(
     )
 
 
-def run_albumentations_sequential(
-    images: list[np.ndarray],
-    prepared: PreparedAlbumentations,
-) -> list[np.ndarray]:
+def run_albumentations_sequential(images: list[np.ndarray], prepared: PreparedAlbumentations,) -> list[np.ndarray]:
     # process the batch in the original image order
     return [
         transform(image=image)["image"]
@@ -144,11 +138,7 @@ def run_albumentations_sequential(
     ]
 
 
-def run_albumentations_threaded(
-    images: list[np.ndarray],
-    prepared: PreparedAlbumentations,
-    executor: ThreadPoolExecutor,
-) -> list[np.ndarray]:
+def run_albumentations_threaded(images: list[np.ndarray], prepared: PreparedAlbumentations, executor: ThreadPoolExecutor,) -> list[np.ndarray]:
     # distribute independent images through the reused thread pool
     # one worker receives one image and its fixed transformation
     def apply_one(item: tuple[np.ndarray, alb.Compose]) -> np.ndarray:
@@ -193,13 +183,7 @@ def tensor_to_numpy_batch(tensor: torch.Tensor) -> list[np.ndarray]:
 
 
 # Kornia CPU and CUDA path
-def prepare_kornia_parameters(
-    profile: AugmentationProfile,
-    batch_size: int,
-    width: int,
-    height: int,
-    device: torch.device,
-) -> KorniaParameters:
+def prepare_kornia_parameters( profile: AugmentationProfile, batch_size: int, width: int, height: int, device: torch.device,) -> KorniaParameters:
     # create one parameter tensor for every transformation component
     # generate the same per-sample values used by Albumentations
     values = [parameters_for_sample(profile, index) for index in range(batch_size)]
@@ -237,6 +221,7 @@ def prepare_kornia_parameters(
 
 def apply_kornia(batch: torch.Tensor, parameters: KorniaParameters,) -> torch.Tensor:
     # execute the same batch pipeline on the tensor device
+    # stops gradient tracking and disables autograd memory allocations
     with torch.inference_mode():
         # every operation creates the next stage of the batch pipeline
         output = batch
@@ -292,17 +277,8 @@ def apply_kornia(batch: torch.Tensor, parameters: KorniaParameters,) -> torch.Te
             output = kornia.enhance.adjust_contrast(output, factor)
 
         if bool((parameters.brightness.abs() > 1e-12).any().item()):
-            factor = parameters.brightness.to(output.dtype).view(
-                batch_size,
-                1,
-                1,
-                1,
-            )
-            output = kornia.enhance.adjust_brightness(
-                output,
-                factor,
-                clip_output=True,
-            )
+            factor = parameters.brightness.to(output.dtype).view(batch_size, 1, 1, 1)
+            output = kornia.enhance.adjust_brightness(output, factor,clip_output=True)
 
         # Gaussian blur is executed as a batch operation
         if parameters.blur_kernel > 1:
