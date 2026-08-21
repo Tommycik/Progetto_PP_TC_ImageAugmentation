@@ -39,12 +39,7 @@ from .report import (
 
 # complete benchmark execution
 
-def run_benchmark(
-    source_images: list[np.ndarray],
-    input_source: str,
-    plan: BenchmarkPlan,
-    build_batch: Callable[[list[np.ndarray], int, int], list[np.ndarray]],
-) -> Path:
+def run_benchmark(source_images: list[np.ndarray], input_source: str, plan: BenchmarkPlan, build_batch: Callable[[list[np.ndarray], int, int], list[np.ndarray]]) -> Path:
     # Execute every profile, resolution, batch and backend configuration.
     cv2.setNumThreads(1)
     result_path = (
@@ -53,8 +48,7 @@ def run_benchmark(
     )
     result_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Kornia uses the same operators on CPU and CUDA. CPU rows vary the
-    # PyTorch intra-operation thread count, while CUDA rows vary timing scope.
+    # Kornia uses the same operators on CPU and CUDA.
     cpu_device = torch.device("cpu")
     cuda_available = torch.cuda.is_available()
     cuda_device = torch.device("cuda:0") if cuda_available else None
@@ -83,13 +77,7 @@ def run_benchmark(
                     # Prepare the common input before any timed backend call.
                     images = build_batch(source_images, resolution, batch_size)
                     prepared = prepare_albumentations(profile, batch_size)
-                    base = _base_row(
-                        plan,
-                        input_source,
-                        profile_name,
-                        resolution,
-                        batch_size,
-                    )
+                    base = _base_row(plan, input_source, profile_name, resolution, batch_size)
 
                     # Albumentations sequential is the stable image reference.
                     sequential_operation = partial(
@@ -130,8 +118,7 @@ def run_benchmark(
                             (workers, threaded_stats, threaded_metrics)
                         )
 
-                    # Convert the batch once because Kornia CPU timing covers only
-                    # tensor augmentation, exactly like the previous CPU scope.
+                    # Convert the batch once because Kornia's timing covers only tensor augmentation, exactly like the previous CPU scope.
                     cpu_tensor = numpy_batch_to_tensor(images)
                     cpu_parameters = prepare_kornia_parameters(
                         profile,
