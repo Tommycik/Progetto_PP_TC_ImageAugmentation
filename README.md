@@ -174,13 +174,11 @@ High performances are useful only if the different implementations still produce
 
 These metrics are useful because Albumentations and Kornia can produce slightly different numerical values even when they apply the same intended augmentation.
 
-### Metrics used in the final report and presentation
+### Metrics not used in the final report and presentation
 
-The CSV contains more information than was needed in the final report and presentation.
+The CSV contains more information than was needed in the final report and the presentation.
 
-The final documents mainly use mean execution time, standard deviation, CV, speedup, CPU parallel efficiency, CUDA peak memory, exact or tolerance matching, MAE and global SSIM. Minimum and maximum times are also used when discussing measurement stability.
-
-Median execution time, Different values, Different pixels, Root mean square error (RMSE), Peak signal-to-noise ratio (PSNR), Image throughput and Pixel throughput are stored mainly for additional inspection and are not presented directly as result metrics in the final report or presentation. Maximum difference is also not shown directly, but it is used by the tolerance check.
+Median execution time, Different values, Root mean square error (RMSE), Peak signal-to-noise ratio (PSNR), Image throughput and Pixel throughput are stored mainly for additional inspections and are not analysed directly in the final report or in the presentation. The Maximum difference is not analysed directly but it is used by the tolerance check.
 
 ## Results interpretation
 
