@@ -132,13 +132,7 @@ def _metric_values(metrics: ComparisonMetrics | None) -> dict[str, str]:
     }
 
 
-def _base_row(
-    plan: BenchmarkPlan,
-    input_source: str,
-    profile_name: str,
-    resolution: int,
-    batch_size: int,
-) -> dict[str, str]:
+def _base_row(plan: BenchmarkPlan, input_source: str, profile_name: str, resolution: int, batch_size: int,) -> dict[str, str]:
     # fields shared by every backend in the current workload
     profile = PROFILES[profile_name]
     return {
@@ -233,11 +227,7 @@ def _result_row(
     return row
 
 
-def _write_row(
-    writer: csv.DictWriter,
-    file_handle: Any,
-    row: dict[str, str],
-) -> None:
+def _write_row( writer: csv.DictWriter, file_handle: Any, row: dict[str, str],) -> None:
     # flush every row so completed workloads survive an interrupted run
     writer.writerow(row)
     file_handle.flush()
