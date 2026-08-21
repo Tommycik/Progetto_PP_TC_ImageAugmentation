@@ -49,8 +49,7 @@ def _configure_runtime() -> None:
     # one OpenCV thread prevents nested parallelism inside each worker
     cv2.setNumThreads(1)
 
-    # one thread is the default outside measurements. The benchmark uses
-    # PyTorch Timer to apply each configured intra-operation thread count.
+    # The benchmark uses PyTorch Timer to apply each configured intra-operation thread count.
     torch.set_num_threads(1)
     try:
         # keep inter-operation scheduling fixed while intra-operation threads vary

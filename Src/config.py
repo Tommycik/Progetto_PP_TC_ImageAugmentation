@@ -145,10 +145,7 @@ FULL_BENCHMARK_PLAN: Final[BenchmarkPlan] = BenchmarkPlan(
 # deterministic parameters
 
 # create a reproducible set of parameters for each sample in a profile
-def parameters_for_sample(
-    profile: AugmentationProfile,
-    sample_index: int,
-) -> SampleParameters:
+def parameters_for_sample( profile: AugmentationProfile, sample_index: int, ) -> SampleParameters:
     # alternate direction and magnitude using only the sample index
     direction = -1.0 if sample_index % 2 else 1.0
     secondary_direction = -1.0 if (sample_index // 2) % 2 else 1.0

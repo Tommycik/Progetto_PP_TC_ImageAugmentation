@@ -84,8 +84,7 @@ def measure(function: Callable[[], Any], warmups: int, repetitions: int, synchro
 
 
 def measure_torch_cpu(function: Callable[[], Any], threads: int, warmups: int, repetitions: int,) -> TimingStatistics:
-    # PyTorch Timer applies the requested intra-operation thread-pool size
-    # only while the Kornia CPU operation is measured.
+    # PyTorch applies the requested intra-operation thread-pool size
     if threads < 1:
         raise ValueError("PyTorch CPU thread count must be positive.")
     if repetitions < 1:
@@ -128,12 +127,7 @@ def measure_torch_cpu(function: Callable[[], Any], threads: int, warmups: int, r
     )
 
 
-
-def measure_paired_scopes(
-    function: Callable[[], tuple[Any, float]],
-    warmups: int,
-    repetitions: int,
-) -> tuple[TimingStatistics, TimingStatistics]:
+def measure_paired_scopes(function: Callable[[], tuple[Any, float]], warmups: int, repetitions: int,) -> tuple[TimingStatistics, TimingStatistics]:
     # one function execution returns the output and its nested device time
     if repetitions < 1:
         raise ValueError("At least one measured repetition is required.")
