@@ -101,14 +101,15 @@ Seven profiles and sixteen resolution-batch combinations produce 112 workloads. 
 1 Albumentations sequential test
 6 Albumentations ThreadPool tests
 6 Kornia CPU thread tests
-1 Kornia CUDA execution recorded with 2 timing scopes
+1 Kornia CUDA test
 ```
 
-The CUDA execution produces one end-to-end row and one device-only row. Every workload therefore produces 15 measured result rows:
+The complete benchmark therefore produces:
 
 ```text
-112 x 15 = 1680 result rows
+112 x 14 = 1568 tests
 ```
+
 
 The fastest valid CPU configuration is selected across Albumentations and Kornia for each workload.
 
