@@ -287,8 +287,7 @@ def run_benchmark(source_images: list[np.ndarray], input_source: str, plan: Benc
                     )
 
                     # CUDA executes the same Kornia operators once per repetition.
-                    # The two CSV rows below are two timing scopes of this one GPU
-                    # pipeline, not two different augmentation implementations.
+                    # The two CSV rows below are two timing scopes of this GPU pipeline.
                     if not cuda_available or cuda_device is None:
                         for backend, scope in (
                             (
